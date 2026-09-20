@@ -62,6 +62,8 @@ Latest additons - third person (shitty as it doesnt spawn ur model) + instant ad
 - **no fog** for scp items + distance fog
 - **no flash from flashbangs**
 - **fullbright** (pretty much just brightness options in write form)
+- **instant ads** instant scope 
+- **third person** shitty as it doesnt spawn ur model
 
 - **FLASHLIGHT MODS (STILL MEM WRITES)** 
 - - Beam angle - how wide flashlight is
