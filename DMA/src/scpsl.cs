@@ -616,6 +616,15 @@ namespace ScpslApp
         public bool TpvRequireKey { get; set; } = true;
         public int TpvKeyMode { get; set; } = 0; // 0 = Toggle, 1 = Hold
 
+        // Freecam (Ghost Flight & Frozen Player)
+        public bool FreecamEnabled { get; set; } = false;
+        public float FreecamSpeed { get; set; } = 12.0f;
+        public bool FreecamHideViewmodel { get; set; } = true;
+        [JsonConverter(typeof(JsonStringEnumConverter<UnityKeyCode>))]
+        public UnityKeyCode FreecamKey { get; set; } = UnityKeyCode.F3;
+        public bool FreecamRequireKey { get; set; } = true;
+        public int FreecamKeyMode { get; set; } = 0; // 0 = Toggle, 1 = Hold
+
 
         [JsonIgnore]
         public bool NoFogEnabled { get => LessFogEnabled; set => LessFogEnabled = value; }
@@ -632,7 +641,7 @@ namespace ScpslApp
     public sealed class ScpslConfig : IConfig
     {
         public LowLevelCache LowLevelCache { get; } = new();
-        public bool MemWritesEnabled => (GameReader.MasterMemWritesEnabled && (GameReader.WorldFovChangerEnabled || GameReader.ViewmodelFovChangerEnabled || GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.AutoBunnyhopEnabled || GameReader.ViewangleAimEnabled || GameReader.NoFlashEnabled || GameReader.NoFogEnabled || GameReader.BrightnessEnabled || GameReader.GunFlashlightEnabled || GameReader.InstantAdsEnabled || GameReader.TpvEnabled))
+        public bool MemWritesEnabled => (GameReader.MasterMemWritesEnabled && (GameReader.WorldFovChangerEnabled || GameReader.ViewmodelFovChangerEnabled || GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.AutoBunnyhopEnabled || GameReader.ViewangleAimEnabled || GameReader.NoFlashEnabled || GameReader.NoFogEnabled || GameReader.BrightnessEnabled || GameReader.GunFlashlightEnabled || GameReader.InstantAdsEnabled || GameReader.TpvEnabled || GameReader.FreecamEnabled))
             || GameReader.IsRestoring
             || GameReader.HasPendingRestores;
         public int MonitorWidth => 1920;
@@ -699,6 +708,7 @@ namespace ScpslApp
                                 DmaBase.DMA.Features.IFeature.DispatchGameStop();
                                 GameReader.TryRestoreInstantAds();
                                 GameReader.TryRestoreTpv();
+                                GameReader.TryRestoreFreecam();
                             }
                         }
                     }
@@ -1368,6 +1378,8 @@ namespace ScpslApp
         public const ulong Fpm_MouseLook = 0x88;
         public const ulong FpcMouseLook_curHorizontal = 0x20;
         public const ulong FpcMouseLook_curVertical = 0x24;
+        public const ulong FpcMouseLook_syncHorizontal = 0x28;
+        public const ulong FpcMouseLook_syncVertical = 0x2C;
         public const ulong FpcMouseLook_inputHorizontal = 0x30;
         public const ulong FpcMouseLook_inputVertical = 0x34;
 
@@ -1638,7 +1650,8 @@ namespace ScpslApp
             _origColorAdjDict.Count > 0 ||
             _activeFlashlightOriginalCaptured ||
             _adsOriginalCaptured ||
-            _tpvWasApplied;
+            _tpvWasApplied ||
+            _freecamWasApplied;
 
         // Viewmodel FOV is changed through the active viewmodel's backing data.
         // No function body, vtable, executable page, or read-only PE data is modified.
@@ -1887,6 +1900,50 @@ namespace ScpslApp
         private static bool _tpvOrigCaptured = false;
         private static ulong _tpvActiveHub = 0;
         private static Vector3 _lastWrittenTpvOffset = Vector3.Zero;
+
+        // Freecam
+        public static bool FreecamEnabled = false;
+        public static float FreecamSpeed = 12.0f;
+        public static bool FreecamHideViewmodel = true;
+        public static UnityKeyCode FreecamKey = UnityKeyCode.F3;
+        public static bool FreecamRequireKey = true;
+        public static int FreecamKeyMode = 0; // 0 = Toggle, 1 = Hold
+        public static string FreecamStatus { get; private set; } = "Off";
+        public static bool FreecamActive { get; private set; } = false;
+
+        private static readonly object _freecamLock = new();
+        private static bool _freecamToggleState = false;
+        private static bool _freecamPrevKeyDown = false;
+        private static bool _freecamWasApplied = false;
+        private static ulong _freecamActiveTranslationAddr = 0;
+        private static ulong _freecamActiveHub = 0;
+        private static Vector3 _freecamOrigPcrPos = Vector3.Zero;
+        private static Vector3 _freecamWorldOffset = Vector3.Zero;
+        private static float _frozenYaw = 0f;
+        private static float _frozenPitch = 0f;
+        private static long _lastFreecamTicks = 0;
+
+        // Cached original movement speeds
+        private static bool _freecamSpeedsCaptured = false;
+        private static ulong _cachedFpcModule = 0;
+        private static ulong _cachedFpcMotor = 0;
+        private static ulong _cachedWalkSpeedOffset = 0;
+        private static ulong _cachedSprintSpeedOffset = 0;
+        private static ulong _cachedCrouchSpeedOffset = 0;
+        private static ulong _cachedSneakSpeedOffset = 0;
+        private static ulong _cachedJumpSpeedOffset = 0;
+        private static ulong _cachedMoveDirOffset = 0;
+        private static float _origWalkSpeed = 0f;
+        private static float _origSprintSpeed = 0f;
+        private static float _origCrouchSpeed = 0f;
+        private static float _origSneakSpeed = 0f;
+        private static float _origJumpSpeed = 0f;
+
+        // Viewmodel hiding state
+        private static bool _freecamVmCaptured = false;
+        private static ulong _freecamVmRootTrs = 0;
+        private static Vector3 _origVmRootScale = Vector3.One;
+        private static Vector3 _origVmRootPos = Vector3.Zero;
 
 
         // HDRP Volume Scanning & Restoration Structures
@@ -6258,6 +6315,12 @@ namespace ScpslApp
         {
             lock (_tpvLock)
             {
+                if (FreecamActive)
+                {
+                    // Freecam takes precedence over PlayerCameraReference
+                    return;
+                }
+
                 if (!MasterMemWritesEnabled || !TpvEnabled)
                 {
                     if (_tpvWasApplied)
@@ -6353,6 +6416,418 @@ namespace ScpslApp
 
                 _tpvWasApplied = true;
                 TpvStatus = $"Active ({TpvDistance:0.1}m)";
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        //  FREECAM (GHOST FLIGHT & FULLY FROZEN CHARACTER)
+        // ═══════════════════════════════════════════════════════════
+        public static bool TryResolveFpcSpeeds(ulong localHub, out ulong fpcMod, out ulong motor)
+        {
+            fpcMod = 0;
+            motor = 0;
+            if (localHub == 0 || !localHub.IsValidVirtualAddress()) return false;
+
+            if (!TryReadObjectField(localHub, "roleManager", out ulong roleManager))
+            {
+                roleManager = Mem.Ptr(localHub + Offsets.RH_roleManager, false);
+                if (!roleManager.IsValidVirtualAddress()) return false;
+            }
+
+            if (!TryReadObjectField(roleManager, "_curRole", out ulong curRole))
+            {
+                curRole = Mem.Ptr(roleManager + Offsets.PRM_curRole, false);
+                if (!curRole.IsValidVirtualAddress()) return false;
+            }
+
+            ulong curRoleKlass = Mem.Ptr(curRole, false);
+            if (!curRoleKlass.IsValidVirtualAddress()) return false;
+
+            if (!TryGetFieldOffset(curRoleKlass, "<FpcModule>k__BackingField", out ulong fpcOffset))
+                fpcOffset = Offsets.Fpc_FpcModule;
+
+            fpcMod = Mem.Ptr(curRole + fpcOffset, false);
+            if (!fpcMod.IsValidVirtualAddress()) return false;
+
+            ulong fpmKlass = Mem.Ptr(fpcMod, false);
+            if (!fpmKlass.IsValidVirtualAddress()) return false;
+
+            if (!TryGetFieldOffset(fpmKlass, "<Motor>k__BackingField", out ulong motorOffset))
+                motorOffset = 0x78;
+
+            motor = Mem.Ptr(fpcMod + motorOffset, false);
+            return true;
+        }
+
+        public static bool TryResolveViewmodelRootTrs(out ulong trsAddr)
+        {
+            trsAddr = 0;
+            ulong ti = Offsets.CameraShakeController_TypeInfo;
+            ulong sf = StaticFields(ti);
+            if (sf == 0) return false;
+            ulong singleton = Mem.Ptr(sf + 0x0, false);
+            if (!singleton.IsValidVirtualAddress()) return false;
+
+            ulong vmRoot = Mem.Ptr(singleton + 0x38, false);
+            if (!vmRoot.IsValidVirtualAddress()) return false;
+
+            ulong nat = Mem.Ptr(vmRoot + 0x10, false);
+            if (!nat.IsValidVirtualAddress()) return false;
+
+            byte[] bytes = new byte[0x40];
+            DmaMemory.ReadBuffer<byte>(nat, bytes.AsSpan(), false);
+            ulong hier = BitConverter.ToUInt64(bytes, 0x28);
+            int idx = BitConverter.ToInt32(bytes, 0x30);
+            if (!hier.IsValidVirtualAddress() || idx < 0) return false;
+
+            ulong verts = Mem.Ptr(hier + 0x18, false);
+            if (!verts.IsValidVirtualAddress()) return false;
+
+            trsAddr = verts + (ulong)idx * 48;
+            return true;
+        }
+
+        private static void PollFreecamViewmodel(ulong localHub, bool hide)
+        {
+            if (!hide)
+            {
+                if (_freecamVmCaptured && _freecamVmRootTrs != 0)
+                {
+                    Vector3 restoreScale = (_origVmRootScale.LengthSquared() > 0.01f) ? _origVmRootScale : Vector3.One;
+                    Mem.TryWriteValue<Vector3>(_freecamVmRootTrs + 0x20, restoreScale);
+                    Mem.TryWriteValue<Vector3>(_freecamVmRootTrs + 0x00, _origVmRootPos);
+                }
+                _freecamVmCaptured = false;
+                _freecamVmRootTrs = 0;
+                return;
+            }
+
+            if (_freecamVmRootTrs == 0)
+            {
+                if (TryResolveViewmodelRootTrs(out ulong trs))
+                {
+                    _freecamVmRootTrs = trs;
+                    Vector3 sc = Mem.Val<Vector3>(trs + 0x20, false);
+                    Vector3 ps = Mem.Val<Vector3>(trs + 0x00, false);
+                    if (sc.LengthSquared() > 0.01f) _origVmRootScale = sc;
+                    _origVmRootPos = ps;
+                    _freecamVmCaptured = true;
+                }
+            }
+
+            if (_freecamVmRootTrs != 0)
+            {
+                // Collapse viewmodel root scale to 0.0001f and translate down 500m to eliminate viewmodel
+                Mem.TryWriteValue<Vector3>(_freecamVmRootTrs + 0x20, new Vector3(0.0001f, 0.0001f, 0.0001f));
+                Mem.TryWriteValue<Vector3>(_freecamVmRootTrs + 0x00, new Vector3(0f, -500f, 0f));
+            }
+        }
+
+        public static bool TryRestoreFreecam()
+        {
+            lock (_freecamLock)
+            {
+                if (_freecamWasApplied || FreecamActive)
+                {
+                    Interlocked.Increment(ref _restoringCounter);
+                    try
+                    {
+                        // 1. Restore native PlayerCameraReference translation
+                        if (_freecamActiveTranslationAddr != 0)
+                        {
+                            Vector3 target = (_freecamOrigPcrPos.LengthSquared() > 25f) ? Vector3.Zero : _freecamOrigPcrPos;
+                            Mem.TryWriteValue<Vector3>(_freecamActiveTranslationAddr, target);
+                        }
+
+                        // 2. Restore character speeds
+                        if (_freecamSpeedsCaptured && _cachedFpcModule != 0 && _cachedWalkSpeedOffset != 0)
+                        {
+                            Mem.TryWriteValue<float>(_cachedFpcModule + _cachedWalkSpeedOffset, _origWalkSpeed);
+                            Mem.TryWriteValue<float>(_cachedFpcModule + _cachedSprintSpeedOffset, _origSprintSpeed);
+                            Mem.TryWriteValue<float>(_cachedFpcModule + _cachedCrouchSpeedOffset, _origCrouchSpeed);
+                            Mem.TryWriteValue<float>(_cachedFpcModule + _cachedSneakSpeedOffset, _origSneakSpeed);
+                            Mem.TryWriteValue<float>(_cachedFpcModule + _cachedJumpSpeedOffset, _origJumpSpeed);
+                        }
+
+                        // 3. Restore viewmodel root
+                        if (_freecamVmCaptured && _freecamVmRootTrs != 0)
+                        {
+                            Vector3 restoreScale = (_origVmRootScale.LengthSquared() > 0.01f) ? _origVmRootScale : Vector3.One;
+                            Mem.TryWriteValue<Vector3>(_freecamVmRootTrs + 0x20, restoreScale);
+                            Mem.TryWriteValue<Vector3>(_freecamVmRootTrs + 0x00, _origVmRootPos);
+                        }
+
+                        // 4. Unfreeze network sync viewangles to live angles
+                        if (TryResolveMouseLook(out ulong mouseLook))
+                        {
+                            float curH = Mem.Val<float>(mouseLook + Offsets.FpcMouseLook_curHorizontal, false);
+                            float curV = Mem.Val<float>(mouseLook + Offsets.FpcMouseLook_curVertical, false);
+                            Mem.TryWriteValue<float>(mouseLook + Offsets.FpcMouseLook_syncHorizontal, curH);
+                            Mem.TryWriteValue<float>(mouseLook + Offsets.FpcMouseLook_syncVertical, curV);
+                        }
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref _restoringCounter);
+                    }
+                }
+
+                _freecamActiveTranslationAddr = 0;
+                _freecamActiveHub = 0;
+                _freecamWasApplied = false;
+                _freecamToggleState = false;
+                _freecamWorldOffset = Vector3.Zero;
+                _freecamSpeedsCaptured = false;
+                _freecamVmCaptured = false;
+                _freecamVmRootTrs = 0;
+                FreecamActive = false;
+                FreecamStatus = "Off";
+
+                if (TpvActive)
+                {
+                    _lastWrittenTpvOffset = Vector3.Zero;
+                }
+
+                return true;
+            }
+        }
+
+        public static void PollFreecam(ref CameraInfo cam, ulong localHub = 0)
+        {
+            lock (_freecamLock)
+            {
+                if (!MasterMemWritesEnabled || !FreecamEnabled)
+                {
+                    if (_freecamWasApplied)
+                    {
+                        TryRestoreFreecam();
+                    }
+                    FreecamActive = false;
+                    FreecamStatus = "Off";
+                    return;
+                }
+
+                if (!cam.Valid)
+                {
+                    if (_freecamWasApplied) TryRestoreFreecam();
+                    FreecamActive = false;
+                    FreecamStatus = "Waiting for camera";
+                    return;
+                }
+
+                if (localHub == 0) localHub = LocalHub();
+                if (localHub == 0)
+                {
+                    if (_freecamWasApplied) TryRestoreFreecam();
+                    FreecamActive = false;
+                    FreecamStatus = "Waiting for player";
+                    return;
+                }
+
+                if (!UnityInput.IsConnected && DmaMemory.UnityBase != 0)
+                {
+                    try { UnityInput.Initialize(DmaMemory.UnityBase); } catch { }
+                }
+
+                bool active = false;
+                if (FreecamRequireKey)
+                {
+                    int vk = UnityInput.ToVirtualKey(FreecamKey);
+                    bool keyDown = UnityInput.IsConnected
+                        ? UnityInput.IsKeyDown(FreecamKey)
+                        : (vk != 0 && IsGameWindowFocused() && (GetAsyncKeyState(vk) & 0x8000) != 0);
+
+                    if (FreecamKeyMode == 0) // Toggle
+                    {
+                        if (keyDown && !_freecamPrevKeyDown)
+                        {
+                            _freecamToggleState = !_freecamToggleState;
+                        }
+                        _freecamPrevKeyDown = keyDown;
+                        active = _freecamToggleState;
+                    }
+                    else // Hold
+                    {
+                        active = keyDown;
+                    }
+                }
+                else
+                {
+                    active = true;
+                }
+
+                if (!active)
+                {
+                    if (_freecamWasApplied)
+                    {
+                        TryRestoreFreecam();
+                    }
+                    FreecamActive = false;
+                    FreecamStatus = FreecamRequireKey ? $"Standby ({FreecamKey})" : "Off";
+                    return;
+                }
+
+                // Freecam is active!
+                FreecamActive = true;
+
+                // 1. Resolve native PlayerCameraReference transform
+                if (localHub != _freecamActiveHub || _freecamActiveTranslationAddr == 0)
+                {
+                    if (_freecamWasApplied) TryRestoreFreecam();
+
+                    if (!TryResolvePcrTranslation(localHub, out ulong trsAddr))
+                    {
+                        FreecamStatus = "Resolving camera transform...";
+                        return;
+                    }
+
+                    _freecamOrigPcrPos = Mem.Val<Vector3>(trsAddr, false);
+                    _freecamActiveTranslationAddr = trsAddr;
+                    _freecamActiveHub = localHub;
+                    _freecamWorldOffset = Vector3.Zero;
+                    _lastFreecamTicks = Stopwatch.GetTimestamp();
+
+                    if (TryResolveMouseLook(out ulong initMl))
+                    {
+                        _frozenYaw = Mem.Val<float>(initMl + Offsets.FpcMouseLook_curHorizontal, false);
+                        _frozenPitch = Mem.Val<float>(initMl + Offsets.FpcMouseLook_curVertical, false);
+                    }
+                }
+
+                // 2. Resolve movement speeds and freeze character
+                if (TryResolveFpcSpeeds(localHub, out ulong fpcMod, out ulong motor))
+                {
+                    _cachedFpcModule = fpcMod;
+                    _cachedFpcMotor = motor;
+
+                    if (_cachedWalkSpeedOffset == 0)
+                    {
+                        ulong fpmKlass = Mem.Ptr(fpcMod, false);
+                        if (!TryGetFieldOffset(fpmKlass, "WalkSpeed", out _cachedWalkSpeedOffset)) _cachedWalkSpeedOffset = 0x40;
+                        if (!TryGetFieldOffset(fpmKlass, "SprintSpeed", out _cachedSprintSpeedOffset)) _cachedSprintSpeedOffset = 0x44;
+                        if (!TryGetFieldOffset(fpmKlass, "CrouchSpeed", out _cachedCrouchSpeedOffset)) _cachedCrouchSpeedOffset = 0x38;
+                        if (!TryGetFieldOffset(fpmKlass, "SneakSpeed", out _cachedSneakSpeedOffset)) _cachedSneakSpeedOffset = 0x3C;
+                        if (!TryGetFieldOffset(fpmKlass, "JumpSpeed", out _cachedJumpSpeedOffset)) _cachedJumpSpeedOffset = 0x48;
+
+                        if (motor != 0)
+                        {
+                            ulong motorKlass = Mem.Ptr(motor, false);
+                            if (!TryGetFieldOffset(motorKlass, "<MoveDirection>k__BackingField", out _cachedMoveDirOffset)) _cachedMoveDirOffset = 0x18;
+                        }
+                    }
+
+                    if (!_freecamSpeedsCaptured)
+                    {
+                        float w = Mem.Val<float>(fpcMod + _cachedWalkSpeedOffset, false);
+                        float s = Mem.Val<float>(fpcMod + _cachedSprintSpeedOffset, false);
+                        float c = Mem.Val<float>(fpcMod + _cachedCrouchSpeedOffset, false);
+                        float sn = Mem.Val<float>(fpcMod + _cachedSneakSpeedOffset, false);
+                        float j = Mem.Val<float>(fpcMod + _cachedJumpSpeedOffset, false);
+
+                        if (w > 0.1f && w < 100f)
+                        {
+                            _origWalkSpeed = w;
+                            _origSprintSpeed = s;
+                            _origCrouchSpeed = c;
+                            _origSneakSpeed = sn;
+                            _origJumpSpeed = j;
+                            _freecamSpeedsCaptured = true;
+                        }
+                    }
+
+                    // Zero all physical movement speeds so character cannot move or jump
+                    Mem.TryWriteValue<float>(fpcMod + _cachedWalkSpeedOffset, 0f);
+                    Mem.TryWriteValue<float>(fpcMod + _cachedSprintSpeedOffset, 0f);
+                    Mem.TryWriteValue<float>(fpcMod + _cachedCrouchSpeedOffset, 0f);
+                    Mem.TryWriteValue<float>(fpcMod + _cachedSneakSpeedOffset, 0f);
+                    Mem.TryWriteValue<float>(fpcMod + _cachedJumpSpeedOffset, 0f);
+
+                    if (motor != 0 && _cachedMoveDirOffset != 0)
+                    {
+                        Mem.TryWriteValue<Vector3>(motor + _cachedMoveDirOffset, Vector3.Zero);
+                    }
+                }
+
+                // 3. Read live view angles from FpcMouseLook and pin network sync values
+                float liveYaw = 0f;
+                float livePitch = 0f;
+                if (TryResolveMouseLook(out ulong mouseLook))
+                {
+                    liveYaw = Mem.Val<float>(mouseLook + Offsets.FpcMouseLook_curHorizontal, false);
+                    livePitch = Mem.Val<float>(mouseLook + Offsets.FpcMouseLook_curVertical, false);
+
+                    // Pin network sync angles so server and spectators see character facing frozen starting direction
+                    Mem.TryWriteValue<float>(mouseLook + Offsets.FpcMouseLook_syncHorizontal, _frozenYaw);
+                    Mem.TryWriteValue<float>(mouseLook + Offsets.FpcMouseLook_syncVertical, _frozenPitch);
+                }
+
+                // 4. Update Freecam Flight Movement
+                long now = Stopwatch.GetTimestamp();
+                float dt = (float)((double)(now - _lastFreecamTicks) / Stopwatch.Frequency);
+                _lastFreecamTicks = now;
+                if (dt <= 0f || dt > 0.1f) dt = 0.016f;
+
+                float speed = Math.Clamp(FreecamSpeed, 1.0f, 50.0f);
+                int shiftVk = UnityInput.ToVirtualKey(UnityKeyCode.LeftShift);
+                bool isShift = UnityInput.IsConnected
+                    ? (UnityInput.IsKeyDown(UnityKeyCode.LeftShift) || UnityInput.IsKeyDown(UnityKeyCode.RightShift))
+                    : (shiftVk != 0 && IsGameWindowFocused() && (GetAsyncKeyState(shiftVk) & 0x8000) != 0);
+
+                if (isShift) speed *= 2.5f;
+
+                // Flight direction vectors: Forward matches 3D gaze, Right is horizontal strafe, Up is global vertical
+                Vector3 camFwd = cam.Valid ? cam.Rotation.Forward() : new Vector3(MathF.Sin(liveYaw * (MathF.PI / 180f)), 0f, MathF.Cos(liveYaw * (MathF.PI / 180f)));
+                Vector3 camRight = cam.Valid ? cam.Rotation.Right() : new Vector3(MathF.Cos(liveYaw * (MathF.PI / 180f)), 0f, -MathF.Sin(liveYaw * (MathF.PI / 180f)));
+                camRight.Y = 0f;
+                if (camRight.LengthSquared() > 0.001f) camRight = Vector3.Normalize(camRight);
+                Vector3 camUp = Vector3.UnitY;
+
+                int wVk = UnityInput.ToVirtualKey(UnityKeyCode.W);
+                int sVk = UnityInput.ToVirtualKey(UnityKeyCode.S);
+                int aVk = UnityInput.ToVirtualKey(UnityKeyCode.A);
+                int dVk = UnityInput.ToVirtualKey(UnityKeyCode.D);
+                int spaceVk = UnityInput.ToVirtualKey(UnityKeyCode.Space);
+                int ctrlVk = UnityInput.ToVirtualKey(UnityKeyCode.LeftControl);
+
+                bool fwd = UnityInput.IsConnected ? UnityInput.IsKeyDown(UnityKeyCode.W) : (wVk != 0 && IsGameWindowFocused() && (GetAsyncKeyState(wVk) & 0x8000) != 0);
+                bool bwd = UnityInput.IsConnected ? UnityInput.IsKeyDown(UnityKeyCode.S) : (sVk != 0 && IsGameWindowFocused() && (GetAsyncKeyState(sVk) & 0x8000) != 0);
+                bool left = UnityInput.IsConnected ? UnityInput.IsKeyDown(UnityKeyCode.A) : (aVk != 0 && IsGameWindowFocused() && (GetAsyncKeyState(aVk) & 0x8000) != 0);
+                bool right = UnityInput.IsConnected ? UnityInput.IsKeyDown(UnityKeyCode.D) : (dVk != 0 && IsGameWindowFocused() && (GetAsyncKeyState(dVk) & 0x8000) != 0);
+                bool up = UnityInput.IsConnected ? UnityInput.IsKeyDown(UnityKeyCode.Space) : (spaceVk != 0 && IsGameWindowFocused() && (GetAsyncKeyState(spaceVk) & 0x8000) != 0);
+                bool down = UnityInput.IsConnected
+                    ? (UnityInput.IsKeyDown(UnityKeyCode.LeftControl) || UnityInput.IsKeyDown(UnityKeyCode.RightControl))
+                    : (ctrlVk != 0 && IsGameWindowFocused() && (GetAsyncKeyState(ctrlVk) & 0x8000) != 0);
+
+                Vector3 moveDir = Vector3.Zero;
+                if (fwd) moveDir += camFwd;
+                if (bwd) moveDir -= camFwd;
+                if (right) moveDir += camRight;
+                if (left) moveDir -= camRight;
+                if (up) moveDir += camUp;
+                if (down) moveDir -= camUp;
+
+                if (moveDir != Vector3.Zero)
+                {
+                    float len = moveDir.Length();
+                    if (len > 0.001f) moveDir /= len;
+                    _freecamWorldOffset += moveDir * (speed * dt);
+                }
+
+                // 5. Dynamic counter-rotation: transform world flight offset into live head local space
+                // ReferenceHub parent only rotates horizontally around Y (Yaw). Counter-rotating strictly around Y
+                // guarantees pitch does not swing or orbit the camera, and Space/Ctrl always ascend/descend vertically.
+                Quaternion qYaw = Quaternion.CreateFromAxisAngle(Vector3.UnitY, liveYaw * (MathF.PI / 180.0f));
+                Quaternion invYaw = Quaternion.Inverse(qYaw);
+                Vector3 localOffset = Vector3.Transform(_freecamWorldOffset, invYaw);
+
+                // Write native PlayerCameraReference translation (original rest pose + counter-rotated flight offset)
+                Mem.TryWriteValue<Vector3>(_freecamActiveTranslationAddr, _freecamOrigPcrPos + localOffset);
+
+                // 6. Viewmodel visibility
+                PollFreecamViewmodel(localHub, FreecamHideViewmodel);
+
+                _freecamWasApplied = true;
+                FreecamStatus = $"Flying ({_freecamWorldOffset.Length():0.1}m away)";
             }
         }
 
@@ -8867,7 +9342,7 @@ namespace ScpslApp
                     {
                         ulong localHub = 0;
                         ulong equippedItem = 0;
-                        if (GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.NoFlashEnabled || GameReader.GunFlashlightEnabled || GameReader.InstantAdsEnabled || GameReader.ViewmodelFovChangerEnabled || GameReader.HasPendingRestores)
+                        if (GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.NoFlashEnabled || GameReader.GunFlashlightEnabled || GameReader.InstantAdsEnabled || GameReader.ViewmodelFovChangerEnabled || GameReader.FreecamEnabled || GameReader.HasPendingRestores)
                         {
                             localHub = GameReader.LocalHub();
                             if (localHub != 0 && (GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.GunFlashlightEnabled || GameReader.InstantAdsEnabled || GameReader.ViewmodelFovChangerEnabled || GameReader.HasPendingRestores))
@@ -8889,6 +9364,7 @@ namespace ScpslApp
                         GameReader.PollViewangleAim(cam, currentPlayers);
                         GameReader.PollNoFlash(localHub);
                         GameReader.PollTpv(ref cam, localHub);
+                        GameReader.PollFreecam(ref cam, localHub);
                     }
                     else if (GameReader.HasPendingRestores)
                     {
@@ -8902,6 +9378,7 @@ namespace ScpslApp
                         GameReader.PollNoFlash(0);
                         var cam = GetLatestCamera();
                         GameReader.PollTpv(ref cam, 0);
+                        GameReader.PollFreecam(ref cam, 0);
                     }
 
                     sw.Stop();
@@ -8995,6 +9472,7 @@ namespace ScpslApp
                                 GameReader.RestoreBrightness();
                                 GameReader.TryRestoreInstantAds();
                                 GameReader.TryRestoreTpv();
+                                GameReader.TryRestoreFreecam();
                                 Log.WriteLine("[DMA] SCP:SL Round Ended / Waiting for Players.");
                             }
                         }
@@ -9209,6 +9687,8 @@ namespace ScpslApp
 
             private static bool _isSelectingTpvKey = false;
             private static int _selectingTpvKeyCooldown = 0;
+            private static bool _isSelectingFreecamKey = false;
+            private static int _selectingFreecamKeyCooldown = 0;
 
             // Icon Resource Caching
             private static readonly Dictionary<ItemType, IntPtr> _iconPointers = new();
@@ -9752,7 +10232,14 @@ namespace ScpslApp
                         TpvShoulderOffset = GameReader.TpvShoulderOffset,
                         TpvKey = GameReader.TpvKey,
                         TpvRequireKey = GameReader.TpvRequireKey,
-                        TpvKeyMode = GameReader.TpvKeyMode
+                        TpvKeyMode = GameReader.TpvKeyMode,
+
+                        FreecamEnabled = GameReader.FreecamEnabled,
+                        FreecamSpeed = GameReader.FreecamSpeed,
+                        FreecamHideViewmodel = GameReader.FreecamHideViewmodel,
+                        FreecamKey = GameReader.FreecamKey,
+                        FreecamRequireKey = GameReader.FreecamRequireKey,
+                        FreecamKeyMode = GameReader.FreecamKeyMode
                     };
 
                     string json = JsonSerializer.Serialize(cfg, new JsonSerializerOptions { WriteIndented = true });
@@ -9892,6 +10379,13 @@ namespace ScpslApp
                     GameReader.TpvRequireKey = cfg.TpvRequireKey;
                     GameReader.TpvKeyMode = cfg.TpvKeyMode;
 
+                    GameReader.FreecamEnabled = cfg.FreecamEnabled;
+                    GameReader.FreecamSpeed = cfg.FreecamSpeed > 0f ? cfg.FreecamSpeed : 12.0f;
+                    GameReader.FreecamHideViewmodel = cfg.FreecamHideViewmodel;
+                    GameReader.FreecamKey = cfg.FreecamKey;
+                    GameReader.FreecamRequireKey = cfg.FreecamRequireKey;
+                    GameReader.FreecamKeyMode = cfg.FreecamKeyMode;
+
 
                     _lastConfigStatus = "Config loaded!";
                     _configStatusTime = DateTime.UtcNow;
@@ -9974,6 +10468,7 @@ namespace ScpslApp
                     GameReader.RestoreGunFlashlight();
                     GameReader.TryRestoreInstantAds();
                     GameReader.TryRestoreTpv();
+                    GameReader.TryRestoreFreecam();
 
                     CleanStaleImguiIni();
 
@@ -10466,6 +10961,99 @@ namespace ScpslApp
                                 }
                                 else
                                 {
+                                    // 1. Freecam
+                                    ToggleSwitch("##FreecamEnabled", ref GameReader.FreecamEnabled, "Freecam");
+                                    if (ImGui.IsItemHovered())
+                                    {
+                                        ImGui.SetTooltip("Detaches camera for 360° free flight (WASD + Space/Ctrl) while keeping your character 100% frozen in place");
+                                    }
+                                    if (GameReader.FreecamEnabled)
+                                    {
+                                        ImGui.Spacing();
+                                        ModernSlider("##FreecamSpeed", "Flight Speed", ref GameReader.FreecamSpeed, 1.0f, 50.0f, "{0:0.0} m/s");
+                                        ImGui.Spacing();
+                                        ToggleSwitch("##FreecamHideVm", ref GameReader.FreecamHideViewmodel, "Hide Viewmodel in Flight");
+                                        if (ImGui.IsItemHovered())
+                                        {
+                                            ImGui.SetTooltip("Hides floating first-person hands/weapon while flying to give a completely unobstructed view (third-person weapon remains visible on your body)");
+                                        }
+                                        ImGui.Spacing();
+                                        ImGui.Checkbox("Require Keybind##FreecamReqKey", ref GameReader.FreecamRequireKey);
+                                        if (GameReader.FreecamRequireKey)
+                                        {
+                                            ImGui.Spacing();
+                                            ImGui.Indent(12f);
+                                            string[] modes = { "Toggle", "Hold" };
+                                            int mode = GameReader.FreecamKeyMode;
+                                            if (ImGui.Combo("Key Mode##FreecamMode", ref mode, modes, modes.Length))
+                                            {
+                                                GameReader.FreecamKeyMode = mode;
+                                            }
+
+                                            ImGui.Spacing();
+                                            ImGui.Text("Keybind:");
+                                            ImGui.SameLine();
+                                            if (_isSelectingFreecamKey)
+                                            {
+                                                ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.85f, 0.40f, 0.20f, 1.00f));
+                                                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.95f, 0.50f, 0.25f, 1.00f));
+                                                ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.75f, 0.35f, 0.15f, 1.00f));
+                                            }
+                                            if (ImGui.Button(_isSelectingFreecamKey ? "Press Key..." : GameReader.FreecamKey.ToString(), new Vector2(100, 24)))
+                                            {
+                                                _isSelectingFreecamKey = true;
+                                                _selectingFreecamKeyCooldown = 10;
+                                            }
+                                            if (_isSelectingFreecamKey)
+                                            {
+                                                ImGui.PopStyleColor(3);
+
+                                                if (_selectingFreecamKeyCooldown > 0)
+                                                {
+                                                    _selectingFreecamKeyCooldown--;
+                                                }
+                                                else
+                                                {
+                                                    if (ImGui.IsKeyPressed(ImGuiKey.Escape))
+                                                    {
+                                                        _isSelectingFreecamKey = false;
+                                                    }
+                                                    else
+                                                    {
+                                                        var pressed = UnityInput.GetFramePressedKeys();
+                                                        if (pressed.Count == 0)
+                                                        {
+                                                            pressed = UnityInput.GetHeldKeys();
+                                                        }
+
+                                                        foreach (var k in pressed)
+                                                        {
+                                                            if (k != UnityKeyCode.None && k != UnityKeyCode.Mouse0 && k != UnityKeyCode.Escape)
+                                                            {
+                                                                GameReader.FreecamKey = k;
+                                                                _isSelectingFreecamKey = false;
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            ImGui.SameLine();
+                                            if (ImGui.Button("Reset##ResetFreecamKey", new Vector2(50, 24)))
+                                            {
+                                                GameReader.FreecamKey = UnityKeyCode.F3;
+                                                _isSelectingFreecamKey = false;
+                                            }
+                                            ImGui.Unindent(12f);
+                                        }
+                                        ImGui.Spacing();
+                                        ImGui.TextColored(new Vector4(0.55f, 0.55f, 0.65f, 1.00f), $"Status: {GameReader.FreecamStatus}");
+                                    }
+
+                                    ImGui.Spacing();
+                                    ImGui.Separator();
+                                    ImGui.Spacing();
+
                                     ToggleSwitch("##WorldFov", ref GameReader.WorldFovChangerEnabled, "World Camera FOV");
                                 ImGui.Spacing();
 
@@ -10923,7 +11511,7 @@ namespace ScpslApp
                                         }
                                     }
                                     ImGui.Spacing();
-                                    ImGui.TextColored(new Vector4(0.55f, 0.55f, 0.65f, 1.00f), $"Status: {GameReader.TpvStatus}");
+                                     ImGui.Spacing();
                                  }
                             }
                             ImGui.EndChild();
@@ -11735,7 +12323,7 @@ namespace ScpslApp
                     // ── Watermark ──
                     if (_showWatermark)
                     {
-                        string wmText = "SCPSL DMA | v1.3";
+                        string wmText = "SCPSL DMA | v1.4";
                         Vector2 wmSize = ImGui.CalcTextSize(wmText);
                         Vector2 wmPos = new(sw - wmSize.X - 16f, 12f);
                         drawList.AddRectFilled(wmPos - new Vector2(6, 3), wmPos + wmSize + new Vector2(6, 3), PackColor(0.05f, 0.05f, 0.08f, 0.60f), 4f);
@@ -12662,6 +13250,7 @@ namespace ScpslApp
                 GameReader.RestoreGunFlashlight();
                 GameReader.TryRestoreInstantAds();
                 GameReader.TryRestoreTpv();
+                GameReader.TryRestoreFreecam();
                 Log.WriteLine($"[FATAL CRASH] Unhandled Exception: {e.ExceptionObject}");
             };
 
@@ -12679,6 +13268,7 @@ namespace ScpslApp
                 GameReader.RestoreGunFlashlight();
                 GameReader.TryRestoreInstantAds();
                 GameReader.TryRestoreTpv();
+                GameReader.TryRestoreFreecam();
                 ScpslOverlay.CleanStaleImguiIni();
             };
 
