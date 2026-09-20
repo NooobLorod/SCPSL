@@ -588,7 +588,7 @@ namespace ScpslApp
         public bool ViewangleAimRequireKey { get; set; } = true;
         public int ViewangleAimKeyMode { get; set; } = 0; // 0 = Hold, 1 = Toggle
 
-        // Visual Enhancements (No Flash, No Fog, Brightness, Gun Flashlight)
+        // Visual Enhancements (No Flash, No Fog, Brightness, Gun Flashlight, TPV)
         public bool NoFlashEnabled { get; set; } = false;
         public bool LessFogEnabled { get; set; } = false;
         public bool FullNoFogEnabled { get; set; } = false;
@@ -602,6 +602,20 @@ namespace ScpslApp
         public float GunFlashlightSpotAngle { get; set; } = 80.0f;
         public float GunFlashlightIntensityMult { get; set; } = 1.0f;
         public float GunFlashlightRange { get; set; } = 60.0f;
+
+        // Instant ADS (Aim-Down-Sights)
+        public bool InstantAdsEnabled { get; set; } = false;
+
+        // Third-Person View (TPV) / Corner Peek Mode
+        public bool TpvEnabled { get; set; } = false;
+        public float TpvDistance { get; set; } = 2.2f;
+        public float TpvHeight { get; set; } = 0.4f;
+        public float TpvShoulderOffset { get; set; } = 0.45f;
+        [JsonConverter(typeof(JsonStringEnumConverter<UnityKeyCode>))]
+        public UnityKeyCode TpvKey { get; set; } = UnityKeyCode.F4;
+        public bool TpvRequireKey { get; set; } = true;
+        public int TpvKeyMode { get; set; } = 0; // 0 = Toggle, 1 = Hold
+
 
         [JsonIgnore]
         public bool NoFogEnabled { get => LessFogEnabled; set => LessFogEnabled = value; }
@@ -618,7 +632,7 @@ namespace ScpslApp
     public sealed class ScpslConfig : IConfig
     {
         public LowLevelCache LowLevelCache { get; } = new();
-        public bool MemWritesEnabled => (GameReader.MasterMemWritesEnabled && (GameReader.WorldFovChangerEnabled || GameReader.ViewmodelFovChangerEnabled || GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.AutoBunnyhopEnabled || GameReader.ViewangleAimEnabled || GameReader.NoFlashEnabled || GameReader.NoFogEnabled || GameReader.BrightnessEnabled || GameReader.GunFlashlightEnabled))
+        public bool MemWritesEnabled => (GameReader.MasterMemWritesEnabled && (GameReader.WorldFovChangerEnabled || GameReader.ViewmodelFovChangerEnabled || GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.AutoBunnyhopEnabled || GameReader.ViewangleAimEnabled || GameReader.NoFlashEnabled || GameReader.NoFogEnabled || GameReader.BrightnessEnabled || GameReader.GunFlashlightEnabled || GameReader.InstantAdsEnabled || GameReader.TpvEnabled))
             || GameReader.IsRestoring
             || GameReader.HasPendingRestores;
         public int MonitorWidth => 1920;
@@ -683,6 +697,8 @@ namespace ScpslApp
                                 DmaBase.DMA.Features.IFeature.DispatchRoundEnd();
                                 OnGameStopped();
                                 DmaBase.DMA.Features.IFeature.DispatchGameStop();
+                                GameReader.TryRestoreInstantAds();
+                                GameReader.TryRestoreTpv();
                             }
                         }
                     }
@@ -1025,6 +1041,11 @@ namespace ScpslApp
         public ulong DisplayName;
         public ulong MyNickSync;
         public ulong HealthModule;
+        public ulong HumeShieldModule;
+        public ulong AhpModule;
+        public float HumeShield;
+        public float MaxHumeShield;
+        public float Ahp;
         public ulong FpcModule;
 
         // Skeleton / Bone Tracking
@@ -1315,6 +1336,7 @@ namespace ScpslApp
         public const ulong RH_static_hostHub = 0x40;
 
         public const ulong RH_playerId = 0x70;
+        public const ulong RH_PlayerCameraReference = 0x78;
         public const ulong RH_characterClassManager = 0x88;
         public const ulong RH_roleManager = 0x90;
         public const ulong RH_playerStats = 0x98;
@@ -1614,7 +1636,9 @@ namespace ScpslApp
             _origLiftGammaDict.Count > 0 ||
             _origExposureDict.Count > 0 ||
             _origColorAdjDict.Count > 0 ||
-            _activeFlashlightOriginalCaptured;
+            _activeFlashlightOriginalCaptured ||
+            _adsOriginalCaptured ||
+            _tpvWasApplied;
 
         // Viewmodel FOV is changed through the active viewmodel's backing data.
         // No function body, vtable, executable page, or read-only PE data is modified.
@@ -1813,6 +1837,40 @@ namespace ScpslApp
         private static float _origNativeSpotAngle;
         private static float _origNativeInnerSpotAngle;
         private static bool _activeFlashlightOriginalCaptured;
+
+        // Instant ADS (Aim-Down-Sights)
+        public static bool InstantAdsEnabled = false;
+        public static string InstantAdsStatus { get; private set; } = "Off";
+        private static readonly object _instantAdsLock = new();
+        private static ulong _activeAdsExtension;
+        private static ulong _activeAdsItem;
+        private static ulong _addrAdsInSpeed;
+        private static ulong _addrAdsOutSpeed;
+        private static float _origAdsInSpeed;
+        private static float _origAdsOutSpeed;
+        private static bool _adsOriginalCaptured;
+        private static bool _adsApplied;
+        private static long _lastAdsVerifyTicks;
+
+        // Third-Person View (TPV) / Corner Peek Mode
+        public static bool TpvEnabled = false;
+        public static float TpvDistance = 2.2f;
+        public static float TpvHeight = 0.4f;
+        public static float TpvShoulderOffset = 0.45f;
+        public static UnityKeyCode TpvKey = UnityKeyCode.F4;
+        public static bool TpvRequireKey = true;
+        public static int TpvKeyMode = 0; // 0 = Toggle, 1 = Hold
+        public static string TpvStatus { get; private set; } = "Off";
+        public static bool TpvActive { get; private set; } = false;
+        private static readonly object _tpvLock = new();
+        private static bool _tpvToggleState = false;
+        private static bool _tpvPrevKeyDown = false;
+        private static bool _tpvWasApplied = false;
+        private static ulong _tpvActiveTranslationAddr = 0;
+        private static Vector3 _origPcrTranslation = Vector3.Zero;
+        private static bool _tpvOrigCaptured = false;
+        private static ulong _tpvActiveHub = 0;
+
 
         // HDRP Volume Scanning & Restoration Structures
         private struct HdrpLiftGammaGainTarget
@@ -5692,6 +5750,375 @@ namespace ScpslApp
             }
         }
 
+        // ═══════════════════════════════════════════════════════════
+        //  INSTANT ADS (AIM-DOWN-SIGHTS)
+        // ═══════════════════════════════════════════════════════════
+        public static bool TryResolveInstantAds(
+            ulong localHub,
+            ulong equippedItem,
+            out ulong adsExtension,
+            out ulong inSpeedAddr,
+            out ulong outSpeedAddr,
+            out string failure)
+        {
+            adsExtension = 0;
+            inSpeedAddr = 0;
+            outSpeedAddr = 0;
+            failure = "No firearm equipped";
+
+            if (localHub == 0 || !localHub.IsValidVirtualAddress())
+            {
+                failure = "Waiting for player";
+                return false;
+            }
+
+            if (equippedItem == 0 || !equippedItem.IsValidVirtualAddress())
+            {
+                failure = "No equipped item";
+                return false;
+            }
+
+            // Resolve Viewmodel
+            if (!TryReadObjectField(equippedItem, "ViewModel", out ulong viewmodel) || viewmodel == 0 || !viewmodel.IsValidVirtualAddress())
+            {
+                viewmodel = Mem.Ptr(equippedItem + 0x30, false);
+            }
+
+            if (viewmodel == 0 || !viewmodel.IsValidVirtualAddress())
+            {
+                failure = "Equipped item has no viewmodel";
+                return false;
+            }
+
+            ulong vmKlass = Mem.Ptr(viewmodel, false);
+            ulong extsOffset = 0;
+            if (!TryGetFieldOffset(vmKlass, "<Extensions>k__BackingField", out extsOffset) &&
+                !TryGetFieldOffset(vmKlass, "_extensions", out extsOffset))
+            {
+                extsOffset = 0xB8;
+            }
+
+            ulong extsArr = Mem.Ptr(viewmodel + extsOffset, false);
+            if (extsArr == 0 && extsOffset != 0xB8)
+            {
+                extsArr = Mem.Ptr(viewmodel + 0xB8, false);
+            }
+
+            if (extsArr != 0 && extsArr.IsValidVirtualAddress())
+            {
+                int len = Mem.Val<int>(extsArr + Offsets.Array_max_length, false);
+                if (len > 0 && len <= 32)
+                {
+                    for (int i = 0; i < len; i++)
+                    {
+                        ulong ext = Mem.Ptr(extsArr + Offsets.Array_items + (ulong)i * 8, false);
+                        if (ext == 0 || !ext.IsValidVirtualAddress()) continue;
+
+                        string name = ClassName(ext);
+                        if (name.IndexOf("AdsExtension", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            name.IndexOf("ViewmodelAdsExtension", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            adsExtension = ext;
+                            ulong extKlass = Mem.Ptr(ext, false);
+                            ulong inOff = 0x88;
+                            ulong outOff = 0x8C;
+                            if (TryGetFieldOffset(extKlass, "_adsInAnimationSpeed", out ulong fo1)) inOff = fo1;
+                            if (TryGetFieldOffset(extKlass, "_adsOutAnimationSpeed", out ulong fo2)) outOff = fo2;
+                            inSpeedAddr = ext + inOff;
+                            outSpeedAddr = ext + outOff;
+                            failure = string.Empty;
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            failure = "Weapon has no ADS extension";
+            return false;
+        }
+
+        public static bool TryRestoreInstantAds()
+        {
+            lock (_instantAdsLock)
+            {
+                if (!_adsOriginalCaptured || _addrAdsInSpeed == 0 || _addrAdsOutSpeed == 0)
+                {
+                    _activeAdsExtension = 0;
+                    _activeAdsItem = 0;
+                    _addrAdsInSpeed = 0;
+                    _addrAdsOutSpeed = 0;
+                    _adsOriginalCaptured = false;
+                    _adsApplied = false;
+                    return true;
+                }
+
+                Interlocked.Increment(ref _restoringCounter);
+                try
+                {
+                    bool ok1 = Mem.TryWriteValue<float>(_addrAdsInSpeed, _origAdsInSpeed);
+                    bool ok2 = Mem.TryWriteValue<float>(_addrAdsOutSpeed, _origAdsOutSpeed);
+
+                    _activeAdsExtension = 0;
+                    _activeAdsItem = 0;
+                    _addrAdsInSpeed = 0;
+                    _addrAdsOutSpeed = 0;
+                    _adsOriginalCaptured = false;
+                    _adsApplied = false;
+                    return ok1 && ok2;
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref _restoringCounter);
+                }
+            }
+        }
+
+        public static void PollInstantAds(ulong localHub = 0, ulong item = 0)
+        {
+            lock (_instantAdsLock)
+            {
+                if (!MasterMemWritesEnabled || !InstantAdsEnabled)
+                {
+                    InstantAdsStatus = TryRestoreInstantAds() ? "Off" : "Restore blocked";
+                    return;
+                }
+
+                if (localHub == 0) localHub = LocalHub();
+                if (localHub == 0)
+                {
+                    TryRestoreInstantAds();
+                    InstantAdsStatus = "Waiting for player";
+                    return;
+                }
+
+                if (item == 0)
+                {
+                    if (!TryReadObjectField(localHub, "inventory", out ulong inv))
+                    {
+                        TryRestoreInstantAds();
+                        InstantAdsStatus = "Inventory unavailable";
+                        return;
+                    }
+                    TryReadObjectField(inv, "_curInstance", out item);
+                }
+
+                if (item == 0)
+                {
+                    TryRestoreInstantAds();
+                    InstantAdsStatus = "No equipped item";
+                    return;
+                }
+
+                long now = Stopwatch.GetTimestamp();
+
+                if (_adsApplied && item == _activeAdsItem && _activeAdsExtension != 0)
+                {
+                    if (now - _lastAdsVerifyTicks < (Stopwatch.Frequency / 10))
+                        return;
+                }
+
+                if (item != _activeAdsItem)
+                {
+                    TryRestoreInstantAds();
+                }
+
+                if (!TryResolveInstantAds(localHub, item, out ulong adsExt, out ulong inAddr, out ulong outAddr, out string fail))
+                {
+                    TryRestoreInstantAds();
+                    InstantAdsStatus = fail;
+                    return;
+                }
+
+                if (_activeAdsExtension != adsExt)
+                {
+                    TryRestoreInstantAds();
+
+                    float origIn = Mem.Val<float>(inAddr, false);
+                    float origOut = Mem.Val<float>(outAddr, false);
+
+                    if (origIn > 0.01f && origIn < 25.0f && origOut > 0.01f && origOut < 25.0f)
+                    {
+                        _origAdsInSpeed = origIn;
+                        _origAdsOutSpeed = origOut;
+                        _adsOriginalCaptured = true;
+                    }
+                    else
+                    {
+                        _origAdsInSpeed = 1.0f;
+                        _origAdsOutSpeed = 1.0f;
+                        _adsOriginalCaptured = true;
+                    }
+
+                    _activeAdsExtension = adsExt;
+                    _activeAdsItem = item;
+                    _addrAdsInSpeed = inAddr;
+                    _addrAdsOutSpeed = outAddr;
+                }
+
+                const float targetSpeed = 50.0f;
+                Mem.TryWriteValue<float>(_addrAdsInSpeed, targetSpeed);
+                Mem.TryWriteValue<float>(_addrAdsOutSpeed, targetSpeed);
+                _adsApplied = true;
+                _lastAdsVerifyTicks = now;
+                InstantAdsStatus = "Active (Instant ADS)";
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        //  THIRD-PERSON VIEW (TPV) / CORNER PEEK MODE
+        // ═══════════════════════════════════════════════════════════
+        public static bool TryResolvePcrTranslation(ulong localHub, out ulong trsAddr)
+        {
+            trsAddr = 0;
+            if (localHub == 0 || !localHub.IsValidVirtualAddress()) return false;
+
+            ulong pcr = Mem.Ptr(localHub + Offsets.RH_PlayerCameraReference, false);
+            if (pcr == 0 || !pcr.IsValidVirtualAddress()) return false;
+
+            ulong pcrNat = Mem.Ptr(pcr + 0x10, false);
+            if (pcrNat == 0 || !pcrNat.IsValidVirtualAddress()) return false;
+
+            byte[] pcrBytes = new byte[0x40];
+            DmaMemory.ReadBuffer<byte>(pcrNat, pcrBytes.AsSpan(), false);
+            ulong pcrHier = BitConverter.ToUInt64(pcrBytes, 0x28);
+            int pcrIdx = BitConverter.ToInt32(pcrBytes, 0x30);
+
+            if (!pcrHier.IsValidVirtualAddress() || pcrIdx < 0) return false;
+
+            ulong pcrVerts = Mem.Ptr(pcrHier + 0x18, false);
+            if (!pcrVerts.IsValidVirtualAddress()) return false;
+
+            trsAddr = pcrVerts + (ulong)pcrIdx * 48;
+            return true;
+        }
+
+        public static bool TryRestoreTpv()
+        {
+            lock (_tpvLock)
+            {
+                if (_tpvActiveTranslationAddr != 0 && _tpvOrigCaptured)
+                {
+                    Interlocked.Increment(ref _restoringCounter);
+                    try
+                    {
+                        // In SCP:SL, first-person PlayerCameraReference translation is always Vector3.Zero.
+                        // If captured original had an active TPV offset (e.g. from an overlay restart while active), fallback to Vector3.Zero.
+                        Vector3 target = (_origPcrTranslation.Z < -0.5f || Math.Abs(_origPcrTranslation.X) > 0.2f) ? Vector3.Zero : _origPcrTranslation;
+                        Mem.TryWriteValue<Vector3>(_tpvActiveTranslationAddr, target);
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref _restoringCounter);
+                    }
+                }
+                _tpvActiveTranslationAddr = 0;
+                _tpvOrigCaptured = false;
+                _tpvWasApplied = false;
+                _tpvToggleState = false;
+                TpvActive = false;
+                TpvStatus = "Off";
+                return true;
+            }
+        }
+
+        public static void PollTpv(ref CameraInfo cam, ulong localHub = 0)
+        {
+            lock (_tpvLock)
+            {
+                if (!MasterMemWritesEnabled || !TpvEnabled)
+                {
+                    if (_tpvWasApplied)
+                    {
+                        TryRestoreTpv();
+                    }
+                    TpvActive = false;
+                    TpvStatus = "Off";
+                    return;
+                }
+
+                if (!cam.Valid)
+                {
+                    if (_tpvWasApplied) TryRestoreTpv();
+                    TpvActive = false;
+                    TpvStatus = "Waiting for camera";
+                    return;
+                }
+
+                if (localHub == 0) localHub = LocalHub();
+                if (localHub == 0)
+                {
+                    if (_tpvWasApplied) TryRestoreTpv();
+                    TpvActive = false;
+                    TpvStatus = "Waiting for player";
+                    return;
+                }
+
+                bool active = false;
+                if (TpvRequireKey)
+                {
+                    bool keyDown = UnityInput.IsKeyDown(TpvKey);
+                    if (TpvKeyMode == 0) // Toggle
+                    {
+                        if (keyDown && !_tpvPrevKeyDown)
+                        {
+                            _tpvToggleState = !_tpvToggleState;
+                        }
+                        _tpvPrevKeyDown = keyDown;
+                        active = _tpvToggleState;
+                    }
+                    else // Hold
+                    {
+                        active = keyDown;
+                    }
+                }
+                else
+                {
+                    active = true;
+                }
+
+                TpvActive = active;
+
+                if (!active)
+                {
+                    if (_tpvWasApplied)
+                    {
+                        TryRestoreTpv();
+                    }
+                    TpvStatus = TpvRequireKey ? $"Standby ({TpvKey})" : "Off";
+                    return;
+                }
+
+                // Resolve native PlayerCameraReference translation
+                if (localHub != _tpvActiveHub || _tpvActiveTranslationAddr == 0)
+                {
+                    if (_tpvWasApplied) TryRestoreTpv();
+
+                    if (!TryResolvePcrTranslation(localHub, out ulong trsAddr))
+                    {
+                        TpvStatus = "Resolving camera transform...";
+                        return;
+                    }
+
+                    _origPcrTranslation = Mem.Val<Vector3>(trsAddr, false);
+                    _tpvActiveTranslationAddr = trsAddr;
+                    _tpvActiveHub = localHub;
+                    _tpvOrigCaptured = true;
+                }
+
+                // Local translation offset: X = Shoulder, Y = Height, -Z = Distance behind
+                Vector3 localOffset = new Vector3(TpvShoulderOffset, TpvHeight, -TpvDistance);
+                Mem.TryWriteValue<Vector3>(_tpvActiveTranslationAddr, localOffset);
+
+                // Note: Unity's native transform hierarchy automatically propagates PlayerCameraReference's
+                // local translation down to Camera.main, and MainCameraController updates LastPosition with
+                // the camera's true world position. Therefore, cam.Position read from ReadCamera() already
+                // contains the third-person offset and does not need to be adjusted manually.
+
+                _tpvWasApplied = true;
+                TpvStatus = $"Active ({TpvDistance:0.1}m)";
+            }
+        }
+
 
         // ═══════════════════════════════════════════════════════════
         //  BRIGHTNESS / FULLBRIGHT (LiftGammaGain, Exposure, ColorAdjustments)
@@ -6498,6 +6925,38 @@ namespace ScpslApp
             Diag.LastBoneMs = sw.Elapsed.TotalMilliseconds;
         }
 
+        public static void ResolveStatModules(PlayerInfo p)
+        {
+            if (p.StatModules == 0 || !p.StatModules.IsValidVirtualAddress()) return;
+            int len = Mem.Val<int>(p.StatModules + Offsets.Array_max_length, false);
+            if (len <= 0 || len > 16) return;
+
+            for (int m = 0; m < len; m++)
+            {
+                ulong mod = Mem.Ptr(p.StatModules + Offsets.Array_items + (ulong)m * 8, false);
+                if (mod == 0 || !mod.IsValidVirtualAddress()) continue;
+
+                string cls = ClassName(mod);
+                if (cls.IndexOf("HealthStat", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    p.HealthModule = mod;
+                }
+                else if (cls.IndexOf("HumeShieldStat", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    p.HumeShieldModule = mod;
+                }
+                else if (cls.IndexOf("AhpStat", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    p.AhpModule = mod;
+                }
+            }
+
+            if (p.HealthModule == 0 && len > 0)
+            {
+                p.HealthModule = Mem.Ptr(p.StatModules + Offsets.Array_items, false);
+            }
+        }
+
         // ── 1. PLAYER LIST & BASE POINTER DISCOVERY (Runs every 2000ms) ──
         public static List<PlayerInfo> PollPlayerList(List<PlayerInfo>? existingPlayers = null)
         {
@@ -6624,11 +7083,31 @@ namespace ScpslApp
                     }
                 }
 
-                // Cache Health Module Pointer
+                // Cache Stat Modules (HealthStat, HumeShieldStat, AhpStat)
                 if (p.StatModules != 0)
                 {
-                    ulong items = Mem.Ptr(p.StatModules + Offsets.Array_items);
-                    if (items != 0) p.HealthModule = items;
+                    if (existing != null && existing.StatModules == p.StatModules && existing.HealthModule != 0)
+                    {
+                        p.HealthModule = existing.HealthModule;
+                        p.HumeShieldModule = existing.HumeShieldModule;
+                        p.AhpModule = existing.AhpModule;
+                    }
+                    else
+                    {
+                        ResolveStatModules(p);
+                    }
+                }
+
+                // Preserve existing position & health state
+                if (existing != null)
+                {
+                    p.Position = existing.Position;
+                    p.HasPosition = existing.HasPosition;
+                    p.Health = existing.Health;
+                    p.MaxHealth = existing.MaxHealth;
+                    p.HumeShield = existing.HumeShield;
+                    p.MaxHumeShield = existing.MaxHumeShield;
+                    p.Ahp = existing.Ahp;
                 }
 
                 // Preserve existing bone setup if role and model haven't changed
@@ -6744,20 +7223,45 @@ namespace ScpslApp
                 var round = map.AddRound(useCache: false);
                 for (int i = 0; i < players.Count; i++)
                 {
-                    ulong hMod = players[i].HealthModule;
-                    if (hMod != 0)
+                    var p = players[i];
+                    var idx = round[i];
+                    if (p.HealthModule != 0)
                     {
-                        round[i].AddEntry<float>(0, hMod + Offsets.Stat_lastValue);
-                        round[i].AddEntry<float>(1, hMod + Offsets.HealthStat_maxValue);
+                        idx.AddEntry<float>(0, p.HealthModule + Offsets.Stat_lastValue);
+                        idx.AddEntry<float>(1, p.HealthModule + Offsets.HealthStat_maxValue);
+                    }
+                    if (p.HumeShieldModule != 0)
+                    {
+                        idx.AddEntry<float>(2, p.HumeShieldModule + Offsets.Stat_lastValue);
+                    }
+                    if (p.AhpModule != 0)
+                    {
+                        idx.AddEntry<float>(3, p.AhpModule + Offsets.Stat_lastValue);
                     }
                 }
                 map.Execute();
 
                 for (int i = 0; i < players.Count; i++)
                 {
+                    var p = players[i];
                     var idx = round[i];
-                    if (idx.TryGetResult(0, out float hp)) players[i].Health = hp;
-                    if (idx.TryGetResult(1, out float maxHp)) players[i].MaxHealth = maxHp > 0f ? maxHp : 100f;
+
+                    bool gotHp = idx.TryGetResult(0, out float rHp);
+                    bool gotMax = idx.TryGetResult(1, out float rMax);
+                    bool gotHume = idx.TryGetResult(2, out float rHume);
+                    bool gotAhp = idx.TryGetResult(3, out float rAhp);
+
+                    if (!gotHp && p.HealthModule == 0) continue;
+
+                    float hp = gotHp ? rHp : p.Health;
+                    float maxHp = gotMax && rMax > 0f ? rMax : p.MaxHealth;
+                    float hume = gotHume ? Math.Max(0f, rHume) : 0f;
+                    float ahp = gotAhp ? Math.Max(0f, rAhp) : 0f;
+
+                    p.Health = hp;
+                    p.MaxHealth = maxHp > 0f ? maxHp : 100f;
+                    p.HumeShield = hume;
+                    p.Ahp = ahp;
                 }
             }
         }
@@ -7991,14 +8495,12 @@ namespace ScpslApp
                         cam = GameReader.ReadCamera();
                     }
 
-                    UpdateCamera(cam);
-
                     ulong localHub = 0;
                     ulong equippedItem = 0;
-                    if (GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.NoFlashEnabled || GameReader.GunFlashlightEnabled || GameReader.HasPendingRestores)
+                    if (GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.NoFlashEnabled || GameReader.GunFlashlightEnabled || GameReader.InstantAdsEnabled || GameReader.HasPendingRestores)
                     {
                         localHub = GameReader.LocalHub();
-                        if (localHub != 0 && (GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.GunFlashlightEnabled || GameReader.HasPendingRestores) && GameReader.TryReadObjectField(localHub, "inventory", out ulong inv))
+                        if (localHub != 0 && (GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.GunFlashlightEnabled || GameReader.InstantAdsEnabled || GameReader.HasPendingRestores) && GameReader.TryReadObjectField(localHub, "inventory", out ulong inv))
                         {
                             GameReader.TryReadObjectField(inv, "_curInstance", out equippedItem);
                         }
@@ -8008,10 +8510,13 @@ namespace ScpslApp
                     GameReader.PollViewmodelFov();
                     GameReader.PollNoSway(localHub, equippedItem);
                     GameReader.PollNoRecoil(localHub, equippedItem);
+                    GameReader.PollInstantAds(localHub, equippedItem);
                     GameReader.PollGunFlashlight(localHub, equippedItem);
                     GameReader.PollBunnyhop();
                     GameReader.PollViewangleAim(cam, currentPlayers);
                     GameReader.PollNoFlash(localHub);
+                    GameReader.PollTpv(ref cam, localHub);
+                    UpdateCamera(cam);
 
                     // Atomically publish lock-free snapshot only when player list reference changes
                     var curSnap = _currentSnapshot;
@@ -8110,6 +8615,8 @@ namespace ScpslApp
                                 GameReader.RestoreNoFlash();
                                 GameReader.RestoreNoSmoke();
                                 GameReader.RestoreBrightness();
+                                GameReader.TryRestoreInstantAds();
+                                GameReader.TryRestoreTpv();
                                 Log.WriteLine("[DMA] SCP:SL Round Ended / Waiting for Players.");
                             }
                         }
@@ -8320,6 +8827,9 @@ namespace ScpslApp
             private static bool _filterDuplicateUtility = false;    // Cull duplicate utility items (Radio, Light)
             private static int _filterMinKeycardTier = 0;           // 0=All, 1=Scientist+, 2=Guard+, 3=Operative+, 4=Captain+, 5=O5 Only
             private static int _filterMinArmorTier = 0;             // 0=All, 1=Light+, 2=Combat+, 3=Heavy Only
+
+            private static bool _isSelectingTpvKey = false;
+            private static int _selectingTpvKeyCooldown = 0;
 
             // Icon Resource Caching
             private static readonly Dictionary<ItemType, IntPtr> _iconPointers = new();
@@ -8853,7 +9363,16 @@ namespace ScpslApp
                         GunFlashlightEnabled = GameReader.GunFlashlightEnabled,
                         GunFlashlightSpotAngle = GameReader.GunFlashlightSpotAngle,
                         GunFlashlightIntensityMult = GameReader.GunFlashlightIntensityMult,
-                        GunFlashlightRange = GameReader.GunFlashlightRange
+                        GunFlashlightRange = GameReader.GunFlashlightRange,
+
+                        InstantAdsEnabled = GameReader.InstantAdsEnabled,
+                        TpvEnabled = GameReader.TpvEnabled,
+                        TpvDistance = GameReader.TpvDistance,
+                        TpvHeight = GameReader.TpvHeight,
+                        TpvShoulderOffset = GameReader.TpvShoulderOffset,
+                        TpvKey = GameReader.TpvKey,
+                        TpvRequireKey = GameReader.TpvRequireKey,
+                        TpvKeyMode = GameReader.TpvKeyMode
                     };
 
                     string json = JsonSerializer.Serialize(cfg, new JsonSerializerOptions { WriteIndented = true });
@@ -8983,6 +9502,16 @@ namespace ScpslApp
                     GameReader.GunFlashlightSpotAngle = cfg.GunFlashlightSpotAngle;
                     GameReader.GunFlashlightIntensityMult = cfg.GunFlashlightIntensityMult;
                     GameReader.GunFlashlightRange = cfg.GunFlashlightRange;
+
+                    GameReader.InstantAdsEnabled = cfg.InstantAdsEnabled;
+                    GameReader.TpvEnabled = cfg.TpvEnabled;
+                    GameReader.TpvDistance = cfg.TpvDistance > 0f ? cfg.TpvDistance : 2.2f;
+                    GameReader.TpvHeight = cfg.TpvHeight;
+                    GameReader.TpvShoulderOffset = cfg.TpvShoulderOffset;
+                    GameReader.TpvKey = cfg.TpvKey;
+                    GameReader.TpvRequireKey = cfg.TpvRequireKey;
+                    GameReader.TpvKeyMode = cfg.TpvKeyMode;
+
 
                     _lastConfigStatus = "Config loaded!";
                     _configStatusTime = DateTime.UtcNow;
@@ -9570,6 +10099,18 @@ namespace ScpslApp
                                 ImGui.Separator();
                                 ImGui.Spacing();
 
+                                ToggleSwitch("##InstantAds", ref GameReader.InstantAdsEnabled, "Instant ADS (Aim-Down-Sights)");
+                                if (ImGui.IsItemHovered())
+                                {
+                                    ImGui.SetTooltip("Snaps weapon directly into aim-down-sights instantly with zero animation delay");
+                                }
+                                ImGui.Spacing();
+                                ImGui.TextColored(new Vector4(0.55f, 0.55f, 0.65f, 1.00f), GameReader.InstantAdsStatus);
+
+                                ImGui.Spacing();
+                                ImGui.Separator();
+                                ImGui.Spacing();
+
                                 ToggleSwitch("##AutoBhop", ref GameReader.AutoBunnyhopEnabled, "Auto-Bunnyhop");
                                 ImGui.Spacing();
                                 ImGui.TextColored(new Vector4(0.55f, 0.55f, 0.65f, 1.00f), GameReader.AutoBunnyhopStatus);
@@ -9764,15 +10305,15 @@ namespace ScpslApp
                                    ImGui.Separator();
                                    ImGui.Spacing();
 
-                                   // 4. Gun Flashlight Enhancement
-                                   ToggleSwitch("##GunFlashlight", ref GameReader.GunFlashlightEnabled, "Gun Flashlight Enhancement");
-                                   if (ImGui.IsItemHovered())
-                                   {
-                                       ImGui.SetTooltip("Enhances beam angle, brightness, and throw distance exclusively on your weapon's flashlight");
-                                   }
-                                   if (GameReader.GunFlashlightEnabled)
-                                   {
-                                       ImGui.Spacing();
+                                   // 4. Flashlight Enhancement (Weapon + Handheld)
+                                    ToggleSwitch("##GunFlashlight", ref GameReader.GunFlashlightEnabled, "Flashlight enhancement (gun flashlights included)");
+                                    if (ImGui.IsItemHovered())
+                                    {
+                                        ImGui.SetTooltip("Enhances beam angle, brightness, and throw distance on flashlights (weapon attachments & handheld flashlights)");
+                                    }
+                                    if (GameReader.GunFlashlightEnabled)
+                                    {
+                                        ImGui.Spacing();
                                         ImGui.Spacing();
                                         ModernSlider("##FlashlightAngle", "Beam Angle", ref GameReader.GunFlashlightSpotAngle, 10.0f, 150.0f, "{0:0}°");
                                         ImGui.Spacing();
@@ -9787,6 +10328,97 @@ namespace ScpslApp
                                             ? new Vector4(0.55f, 0.55f, 0.65f, 1.00f)
                                             : new Vector4(1.00f, 0.75f, 0.30f, 1.00f));
                                     ImGui.TextColored(statusCol, $"Status: {GameReader.GunFlashlightStatus}");
+
+                                    ImGui.Spacing();
+                                    ImGui.Separator();
+                                    ImGui.Spacing();
+
+                                    // 5. Third-Person View (Corner Peek)
+                                    ToggleSwitch("##TpvEnabled", ref GameReader.TpvEnabled, "Third-Person View (Corner Peek)");
+                                    if (ImGui.IsItemHovered())
+                                    {
+                                        ImGui.SetTooltip("Offsets camera into third-person shoulder view, enabling tactical corner and cover peeking");
+                                    }
+                                    if (GameReader.TpvEnabled)
+                                    {
+                                        ImGui.Spacing();
+                                        ModernSlider("##TpvDist", "Camera Distance", ref GameReader.TpvDistance, 1.0f, 4.5f, "{0:0.0}m");
+                                        ImGui.Spacing();
+                                        ModernSlider("##TpvHeight", "Camera Height", ref GameReader.TpvHeight, -0.5f, 1.5f, "+{0:0.0}m");
+                                        ImGui.Spacing();
+                                        ModernSlider("##TpvShoulder", "Shoulder Offset", ref GameReader.TpvShoulderOffset, -1.2f, 1.2f, "{0:0.0}m");
+                                        ImGui.Spacing();
+                                        ImGui.Checkbox("Require Keybind##TpvReqKey", ref GameReader.TpvRequireKey);
+                                        if (GameReader.TpvRequireKey)
+                                        {
+                                            ImGui.Spacing();
+                                            ImGui.Indent(12f);
+                                            string[] modes = { "Toggle", "Hold" };
+                                            int mode = GameReader.TpvKeyMode;
+                                            if (ImGui.Combo("Key Mode##TpvMode", ref mode, modes, modes.Length))
+                                            {
+                                                GameReader.TpvKeyMode = mode;
+                                            }
+
+                                            ImGui.Spacing();
+                                            ImGui.Text("Keybind:");
+                                            ImGui.SameLine();
+                                            if (_isSelectingTpvKey)
+                                            {
+                                                ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.85f, 0.40f, 0.20f, 1.00f));
+                                                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.95f, 0.50f, 0.25f, 1.00f));
+                                                ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.75f, 0.35f, 0.15f, 1.00f));
+                                            }
+                                            if (ImGui.Button(_isSelectingTpvKey ? "Press Key..." : GameReader.TpvKey.ToString(), new Vector2(100, 24)))
+                                            {
+                                                _isSelectingTpvKey = true;
+                                                _selectingTpvKeyCooldown = 10;
+                                            }
+                                            if (_isSelectingTpvKey)
+                                            {
+                                                ImGui.PopStyleColor(3);
+
+                                                if (_selectingTpvKeyCooldown > 0)
+                                                {
+                                                    _selectingTpvKeyCooldown--;
+                                                }
+                                                else
+                                                {
+                                                    if (ImGui.IsKeyPressed(ImGuiKey.Escape))
+                                                    {
+                                                        _isSelectingTpvKey = false;
+                                                    }
+                                                    else
+                                                    {
+                                                        var pressed = UnityInput.GetFramePressedKeys();
+                                                        if (pressed.Count == 0)
+                                                        {
+                                                            pressed = UnityInput.GetHeldKeys();
+                                                        }
+
+                                                        foreach (var k in pressed)
+                                                        {
+                                                            if (k != UnityKeyCode.None && k != UnityKeyCode.Mouse0 && k != UnityKeyCode.Escape)
+                                                            {
+                                                                GameReader.TpvKey = k;
+                                                                _isSelectingTpvKey = false;
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            ImGui.SameLine();
+                                            if (ImGui.Button("Reset##ResetTpvKey", new Vector2(50, 24)))
+                                            {
+                                                GameReader.TpvKey = UnityKeyCode.F4;
+                                                _isSelectingTpvKey = false;
+                                            }
+                                            ImGui.Unindent(12f);
+                                        }
+                                    }
+                                    ImGui.Spacing();
+                                    ImGui.TextColored(new Vector4(0.55f, 0.55f, 0.65f, 1.00f), $"Status: {GameReader.TpvStatus}");
                                  }
                             }
                             ImGui.EndChild();
@@ -10412,11 +11044,11 @@ namespace ScpslApp
                         }
                     }
 
-                    if (players.Count == 0) return;
-
                     // ── Player ESP ──
-                    float playerMaxDistSq = _maxDistance * _maxDistance;
-                    foreach (var p in players)
+                    if (players.Count > 0)
+                    {
+                        float playerMaxDistSq = _maxDistance * _maxDistance;
+                        foreach (var p in players)
                     {
                         if (p.IsLocal || !p.HasPosition || !p.Alive) continue;
 
@@ -10550,8 +11182,8 @@ namespace ScpslApp
                             drawList.AddText(new Vector2(hx - roleSize.X / 2f, hy + height + 2), GetRoleColor(p.Role), roleName);
                         }
                     }
-
-                    // FOV Circle for Viewangle Aim
+                }
+                    // ── FOV Circle for Viewangle Aim ──
                     if (GameReader.MasterMemWritesEnabled && GameReader.ViewangleAimEnabled && GameReader.ViewangleAimDrawFov)
                     {
                         float camFov = cam.Fov > 10f && cam.Fov < 170f ? cam.Fov : 70.0f;
@@ -10564,6 +11196,16 @@ namespace ScpslApp
                             Vector2 screenCenter = new Vector2(sw * 0.5f, sh * 0.5f);
                             drawList.AddCircle(screenCenter, screenRadius, PackColor(0.85f, 0.40f, 0.95f, 0.65f), 64, 1.5f);
                         }
+                    }
+
+                    // ── Watermark ──
+                    if (_showWatermark)
+                    {
+                        string wmText = "SCPSL DMA | v1.3";
+                        Vector2 wmSize = ImGui.CalcTextSize(wmText);
+                        Vector2 wmPos = new(sw - wmSize.X - 16f, 12f);
+                        drawList.AddRectFilled(wmPos - new Vector2(6, 3), wmPos + wmSize + new Vector2(6, 3), PackColor(0.05f, 0.05f, 0.08f, 0.60f), 4f);
+                        drawList.AddText(wmPos, PackColor(0.35f, 0.85f, 0.95f, 0.90f), wmText);
                     }
             }
         }
@@ -10832,6 +11474,39 @@ namespace ScpslApp
                         float innerSpot = Mem.Val<float>(lightData + 0x4C, false);
                         Console.WriteLine($"    Native Light values: intensity={intensity}, range={range}, spotAngle={spot}, innerSpotAngle={innerSpot}");
                     }
+
+                    if (vm != 0)
+                    {
+                        DumpClassFields("Viewmodel (vm)", vm);
+                        if (GameReader.TryGetFieldOffset(Mem.Ptr(vm, false), "<Extensions>k__BackingField", out ulong extsOff))
+                        {
+                            ulong extsArr = Mem.Ptr(vm + extsOff, false);
+                            if (extsArr != 0)
+                            {
+                                int len = Mem.Val<int>(extsArr + Offsets.Array_max_length, false);
+                                for (int e = 0; e < len && e < 16; e++)
+                                {
+                                    ulong ext = Mem.Ptr(extsArr + Offsets.Array_items + (ulong)e * 8, false);
+                                    if (ext != 0) DumpClassFields($"Viewmodel Extension [{e}]", ext);
+                                }
+                            }
+                        }
+                    }
+
+                    ulong mccSf = StaticFields(Offsets.MainCameraController_TypeInfo);
+                    if (mccSf != 0)
+                    {
+                        Console.WriteLine($"\n--- MCC Static Fields: 0x{mccSf:X} ---");
+                        ulong mccInst = Mem.Ptr(mccSf + 0x0, false);
+                        if (mccInst != 0) DumpClassFields("MainCameraController Instance", mccInst);
+                    }
+
+                    ulong cscSf = StaticFields(Offsets.CameraShakeController_TypeInfo);
+                    if (cscSf != 0)
+                    {
+                        ulong cscInst = Mem.Ptr(cscSf + 0x0, false);
+                        if (cscInst != 0) DumpClassFields("CameraShakeController Instance", cscInst);
+                    }
                 }
                 else
                 {
@@ -10915,6 +11590,416 @@ namespace ScpslApp
                     {
                         int hbIdx = (p.HitboxIndices != null && b < p.HitboxIndices.Length) ? p.HitboxIndices[b] : -1;
                         Console.WriteLine($"       Bone[{b:D2}] (hbTrIndex={hbIdx:D3}): {p.BonePositions[b]}");
+                    }
+                }
+            }
+
+            // 4. Test StatModules inspection
+            Console.WriteLine("\n--- TESTING STATMODULES INSPECTION ---");
+            for (int i = 0; i < players.Count; i++)
+            {
+                var p = players[i];
+                Console.WriteLine($"\nPlayer[{i:D2}]: Name='{p.Name}' Role={p.Role} Hub=0x{p.Hub:X} StatModules=0x{p.StatModules:X}");
+                if (p.StatModules != 0)
+                {
+                    int len = Mem.Val<int>(p.StatModules + Offsets.Array_max_length, false);
+                    Console.WriteLine($"  StatModules Array len={len}");
+                    for (int m = 0; m < len && m < 16; m++)
+                    {
+                        ulong mod = Mem.Ptr(p.StatModules + Offsets.Array_items + (ulong)m * 8, false);
+                        if (mod != 0)
+                        {
+                            string cls = GameReader.ClassName(mod);
+                            float curVal = Mem.Val<float>(mod + Offsets.Stat_lastValue, false);
+                            float maxVal = Mem.Val<float>(mod + Offsets.HealthStat_maxValue, false);
+                            Console.WriteLine($"    [{m}]: mod=0x{mod:X} Class={cls} lastVal={curVal:0.##} maxVal={maxVal:0.##}");
+                        }
+                    }
+                }
+            }
+
+            // 5. Test CameraShakeController & MainCameraController
+            Console.WriteLine("\n--- TESTING CAMERA CONTROLLERS ---");
+            ulong cscSf2 = StaticFields(Offsets.CameraShakeController_TypeInfo);
+            if (cscSf2 != 0)
+            {
+                ulong cscInst = Mem.Ptr(cscSf2 + 0x0, false);
+                Console.WriteLine($"CameraShakeController Singleton: 0x{cscInst:X}");
+                if (cscInst != 0)
+                {
+                    ulong camObj = Mem.Ptr(cscInst + 0x20, false);
+                    Vector3 startPos = Mem.Val<Vector3>(cscInst + 0x28, false);
+                    ulong vmRoot = Mem.Ptr(cscInst + 0x38, false);
+                    Console.WriteLine($"  _camera: 0x{camObj:X} ({GameReader.ClassName(camObj)})");
+                    Console.WriteLine($"  Initial _startPos: {startPos}");
+                    Console.WriteLine($"  _viewmodelRoot: 0x{vmRoot:X} ({GameReader.ClassName(vmRoot)})");
+
+                    // Test writing TPV offset to _startPos
+                    Vector3 testOffset = new Vector3(0.45f, 0.35f, -2.2f);
+                    Console.WriteLine($"  --> Testing write of {testOffset} to _startPos (0x{cscInst + 0x28:X})...");
+                    bool wOk = Mem.TryWriteValue<Vector3>(cscInst + 0x28, testOffset);
+                    Console.WriteLine($"  --> Write result: {wOk}");
+                    Thread.Sleep(150);
+                    Vector3 readBack = Mem.Val<Vector3>(cscInst + 0x28, false);
+                    Console.WriteLine($"  --> Read back after 150ms: {readBack}");
+
+                    // Check MainCameraController LastPosition after 150ms
+                    ulong mccSfTest = StaticFields(Offsets.MainCameraController_TypeInfo);
+                    Vector3 mccPos = Mem.Val<Vector3>(mccSfTest + 0x14, false);
+                    Console.WriteLine($"  --> MCC LastPosition after 150ms: {mccPos}");
+
+                    // Restore _startPos back to original
+                    Mem.TryWriteValue<Vector3>(cscInst + 0x28, startPos);
+                    Console.WriteLine($"  --> Restored _startPos to {startPos}");
+                }
+            }
+
+            ulong mccSf2 = StaticFields(Offsets.MainCameraController_TypeInfo);
+            if (mccSf2 != 0)
+            {
+                ulong curCam = Mem.Ptr(mccSf2 + 0x30, false);
+                ulong mccInst2 = Mem.Ptr(mccSf2 + 0x38, false);
+                Vector3 lastPos = Mem.Val<Vector3>(mccSf2 + 0x14, false);
+                Vector3 defaultPos = Mem.Val<Vector3>(mccSf2 + 0x40, false);
+                Console.WriteLine($"MainCameraController Static Fields: 0x{mccSf2:X}");
+                Console.WriteLine($"  _currentCamera: 0x{curCam:X} ({GameReader.ClassName(curCam)})");
+                Console.WriteLine($"  _singleton: 0x{mccInst2:X} ({GameReader.ClassName(mccInst2)})");
+                Console.WriteLine($"  LastPosition: {lastPos}");
+                Console.WriteLine($"  _defaultPos: {defaultPos}");
+
+                ulong sccRva = 0x846900;
+                ulong sccAddr = DmaMemory.GameAssemblyBase + sccRva;
+                byte[] sccBytes = new byte[128];
+                DmaMemory.ReadBuffer<byte>(sccAddr, sccBytes.AsSpan(), false);
+                Console.WriteLine($"  set_CurrentCamera bytes at 0x{sccAddr:X} (RVA 0x{sccRva:X}):");
+                Console.WriteLine($"    {BitConverter.ToString(sccBytes)}");
+
+                ulong cscLuRva = 0x7AE540;
+                ulong cscLuAddr = DmaMemory.GameAssemblyBase + cscLuRva;
+                byte[] cscLuBytes = new byte[128];
+                DmaMemory.ReadBuffer<byte>(cscLuAddr, cscLuBytes.AsSpan(), false);
+                Console.WriteLine($"  CameraShakeController.LateUpdate bytes at 0x{cscLuAddr:X} (RVA 0x{cscLuRva:X}):");
+                Console.WriteLine($"    {BitConverter.ToString(cscLuBytes)}");
+
+                // Inspect PlayerCameraReference on LocalHub
+                ulong diagLocalHub = LocalHub();
+                if (diagLocalHub != 0)
+                {
+                    ulong pcr = Mem.Ptr(diagLocalHub + 0x78, false);
+                    Console.WriteLine($"  LocalHub (0x{diagLocalHub:X}) PlayerCameraReference (+0x78): 0x{pcr:X} ({GameReader.ClassName(pcr)})");
+                    if (pcr != 0)
+                    {
+                        ulong pcrNat = Mem.Ptr(pcr + 0x10, false);
+                        Console.WriteLine($"    PlayerCameraReference natTr: 0x{pcrNat:X}");
+                        byte[] pcrBytes = new byte[0x40];
+                        DmaMemory.ReadBuffer<byte>(pcrNat, pcrBytes.AsSpan(), false);
+                        ulong pcrHier = BitConverter.ToUInt64(pcrBytes, 0x28);
+                        int pcrIdx = BitConverter.ToInt32(pcrBytes, 0x30);
+                        Console.WriteLine($"    pcrNat Hierarchy: 0x{pcrHier:X}, Index: {pcrIdx}");
+                        if (pcrHier.IsValidVirtualAddress())
+                        {
+                            ulong pcrVerts = Mem.Ptr(pcrHier + 0x18, false);
+                            if (pcrVerts.IsValidVirtualAddress())
+                            {
+                                var pcrTrs = Mem.Val<UnityTransform.TrsX>(pcrVerts + (ulong)pcrIdx * 48, false);
+                                Console.WriteLine($"    pcr Node[{pcrIdx}]: t={pcrTrs.t}, q={pcrTrs.q}, s={pcrTrs.s}");
+
+                                Console.WriteLine($"    --> Testing write to PlayerCameraReference TrsX.t (0x{pcrVerts + (ulong)pcrIdx * 48:X})...");
+                                Vector3 testPcrOffset = new Vector3(0.45f, 0.35f, -2.2f);
+                                bool wPcr = Mem.TryWriteValue<Vector3>(pcrVerts + (ulong)pcrIdx * 48, testPcrOffset);
+                                Console.WriteLine($"    --> Write result: {wPcr}");
+                                Thread.Sleep(150);
+                                var readBackPcr = Mem.Val<UnityTransform.TrsX>(pcrVerts + (ulong)pcrIdx * 48, false);
+                                ulong mccSfNow = StaticFields(Offsets.MainCameraController_TypeInfo);
+                                Vector3 mccNow = Mem.Val<Vector3>(mccSfNow + 0x14, false);
+                                Console.WriteLine($"    --> After 150ms pcr TrsX.t: {readBackPcr.t} (target was {testPcrOffset})");
+                                Console.WriteLine($"    --> After 150ms MCC LastPosition: {mccNow}");
+                                Mem.TryWriteValue<Vector3>(pcrVerts + (ulong)pcrIdx * 48, Vector3.Zero);
+                                Console.WriteLine("    --> Restored pcr TrsX.t to <0, 0, 0>");
+                            }
+                        }
+                    }
+
+                    ulong rm = Mem.Ptr(diagLocalHub + Offsets.RH_roleManager, false);
+                    ulong curRole = (rm != 0) ? Mem.Ptr(rm + Offsets.PRM_curRole, false) : 0;
+                    Console.WriteLine($"  LocalHub curRole: 0x{curRole:X} ({GameReader.ClassName(curRole)})");
+                    if (curRole != 0)
+                    {
+                        ulong camTrRole = Mem.Ptr(curRole + 0xC8, false);
+                        Console.WriteLine($"    curRole._cameraTransform (+0xC8): 0x{camTrRole:X} ({GameReader.ClassName(camTrRole)})");
+
+                        ulong fpcMod = Mem.Ptr(curRole + Offsets.Fpc_FpcModule, false);
+                        Console.WriteLine($"    curRole.FpcModule (+0x80): 0x{fpcMod:X} ({GameReader.ClassName(fpcMod)})");
+                        if (fpcMod != 0)
+                        {
+                            ulong sp = Mem.Ptr(fpcMod + 0x90, false);
+                            Console.WriteLine($"      FpcModule.StateProcessor (+0x90): 0x{sp:X} ({GameReader.ClassName(sp)})");
+                            if (sp != 0)
+                            {
+                                ulong cp = Mem.Ptr(sp + 0x50, false);
+                                Console.WriteLine($"        StateProcessor._camPivot (+0x50): 0x{cp:X} ({GameReader.ClassName(cp)})");
+                                if (cp != 0)
+                                {
+                                    ulong cpNat = Mem.Ptr(cp + 0x10, false);
+                                    Console.WriteLine($"          _camPivot natTr: 0x{cpNat:X}");
+                                }
+                            }
+
+                            ulong ml = Mem.Ptr(fpcMod + 0x88, false);
+                            Console.WriteLine($"      FpcModule.MouseLook (+0x88): 0x{ml:X} ({GameReader.ClassName(ml)})");
+
+                            DumpClassFields("curRole", curRole);
+                            DumpClassFields("fpcMod", fpcMod);
+
+                            ulong cm = Mem.Ptr(fpcMod + Offsets.Fpm_CharacterModelInstance, false);
+                            Console.WriteLine($"      FpcModule.CharacterModel (+0xA0): 0x{cm:X} ({GameReader.ClassName(cm)})");
+                            if (cm != 0)
+                            {
+                                DumpClassFields("CharacterModel", cm);
+                                ulong cmNat = Mem.Ptr(cm + 0x10, false);
+                                ulong cmGo = (cmNat != 0) ? Mem.Ptr(cmNat + 0x18, false) : 0;
+                                Console.WriteLine($"      cm GameObject: 0x{cmGo:X}");
+                                if (cmGo != 0)
+                                {
+                                    int cmLayer = Mem.Val<int>(cmGo + 0x38, false);
+                                    Console.WriteLine($"      cm GameObject layer bytes at +0x38: {cmLayer} (0x{cmLayer:X})");
+                                    ulong comps = Mem.Ptr(cmGo + UnityOffsets.GameObject.ComponentsOffset, false);
+                                    if (comps != 0)
+                                    {
+                                        for (int c = 0; c < 16; c++)
+                                        {
+                                            ulong compPtr = Mem.Ptr(comps + (ulong)c * 8, false);
+                                            if (compPtr != 0)
+                                            {
+                                                Console.WriteLine($"        cm Comp[{c}]: 0x{compPtr:X} ({GameReader.ClassName(compPtr)})");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Deep inspection of cm._renderers (+0xA0)
+                            ulong rendArr = Mem.Ptr(cm + 0xA0, false);
+                            Console.WriteLine($"      cm._renderers (+0xA0): 0x{rendArr:X}");
+                            if (rendArr != 0)
+                            {
+                                int rendCount = Mem.Val<int>(rendArr + 0x18, false);
+                                Console.WriteLine($"      cm._renderers Count: {rendCount}");
+                                for (int r = 0; r < Math.Min(rendCount, 16); r++)
+                                {
+                                    ulong rendPtr = Mem.Ptr(rendArr + 0x20 + (ulong)r * 8, false);
+                                    if (rendPtr != 0)
+                                    {
+                                        ulong natRend = Mem.Ptr(rendPtr + 0x10, false);
+                                        byte mEnabled = Mem.Val<byte>(natRend + 0x38, false);
+                                        Console.WriteLine($"        Renderer[{r}]: 0x{rendPtr:X} ({GameReader.ClassName(rendPtr)}), nat=0x{natRend:X}, m_Enabled={mEnabled}");
+                                    }
+                                }
+                            }
+
+                            // Test writing IsVisible = true (+0xD0)
+                            byte curVis = Mem.Val<byte>(cm + 0xD0, false);
+                            Console.WriteLine($"      cm.<IsVisible> (+0xD0): {curVis}");
+                            Console.WriteLine("      --> Testing write of IsVisible = 1 to cm+0xD0...");
+                            Mem.TryWriteValue<byte>(cm + 0xD0, 1);
+                            Thread.Sleep(150);
+                            byte readVis = Mem.Val<byte>(cm + 0xD0, false);
+                            Console.WriteLine($"      --> Read back after 150ms: {readVis}");
+                            Mem.TryWriteValue<byte>(cm + 0xD0, curVis);
+                        }
+
+                        ulong diagInv = Mem.Ptr(diagLocalHub + Offsets.RH_inventory, false);
+                        Console.WriteLine($"  LocalHub Inventory (+0xA0): 0x{diagInv:X} ({GameReader.ClassName(diagInv)})");
+                        if (diagInv != 0)
+                        {
+                            DumpClassFields("Inventory", diagInv);
+                            if (GameReader.TryReadObjectField(diagInv, "_curInstance", out ulong curItem) && curItem != 0)
+                            {
+                                Console.WriteLine($"    _curInstance: 0x{curItem:X} ({GameReader.ClassName(curItem)})");
+                                DumpClassFields("CurInstance", curItem);
+
+                                ulong tpModel = Mem.Ptr(curItem + 0x28, false);
+                                ulong vmModel = Mem.Ptr(curItem + 0x30, false);
+                                ulong wmModel = Mem.Ptr(curItem + 0x120, false);
+                                Console.WriteLine($"    tpModel (+0x28): 0x{tpModel:X} ({GameReader.ClassName(tpModel)})");
+                                Console.WriteLine($"    vmModel (+0x30): 0x{vmModel:X} ({GameReader.ClassName(vmModel)})");
+                                Console.WriteLine($"    wmModel (+0x120): 0x{wmModel:X} ({GameReader.ClassName(wmModel)})");
+
+                                if (tpModel != 0) DumpClassFields("ThirdpersonModel", tpModel);
+                                if (wmModel != 0) DumpClassFields("WorldModel", wmModel);
+                            }
+                        }
+                    }
+                }
+
+                // Inspect native camera
+                if (cscSf2 != 0)
+                {
+                    ulong cscInst = Mem.Ptr(cscSf2 + 0x0, false);
+                    ulong camObj = (cscInst != 0) ? Mem.Ptr(cscInst + 0x20, false) : 0;
+                    if (camObj != 0)
+                    {
+                        ulong natCam = Mem.Ptr(camObj + 0x10, false);
+                        Console.WriteLine($"  natCam (camObj+0x10): 0x{natCam:X}");
+                        if (natCam != 0)
+                        {
+                            byte[] camBytes = new byte[0x300];
+                            DmaMemory.ReadBuffer<byte>(natCam, camBytes.AsSpan(), false);
+                            Console.WriteLine("    Scanning natCam for matrix / position floats:");
+                            for (int o = 0; o < 0x2E0; o += 16)
+                            {
+                                float f0 = BitConverter.ToSingle(camBytes, o);
+                                float f1 = BitConverter.ToSingle(camBytes, o + 4);
+                                float f2 = BitConverter.ToSingle(camBytes, o + 8);
+                                float f3 = BitConverter.ToSingle(camBytes, o + 12);
+                                if (!float.IsNaN(f0) && !float.IsNaN(f1) && !float.IsNaN(f2) && !float.IsNaN(f3))
+                                {
+                                    if (Math.Abs(f0) > 0.001f || Math.Abs(f1) > 0.001f || Math.Abs(f2) > 0.001f || Math.Abs(f3) > 0.001f)
+                                    {
+                                        Console.WriteLine($"      +0x{o:X3}: ({f0:0.###}, {f1:0.###}, {f2:0.###}, {f3:0.###})");
+                                    }
+                                }
+                            }
+                            ulong camGo = Mem.Ptr(natCam + 0x18, false);
+                            Console.WriteLine($"  camGo (natCam+0x18): 0x{camGo:X}");
+                            if (camGo != 0)
+                            {
+                                ulong comps = Mem.Ptr(camGo + UnityOffsets.GameObject.ComponentsOffset, false);
+                                Console.WriteLine($"    camGo ComponentsArray (0x{UnityOffsets.GameObject.ComponentsOffset:X}): 0x{comps:X}");
+                                if (comps != 0)
+                                {
+                                    for (int c = 0; c < 8; c++)
+                                    {
+                                        ulong compPtr = Mem.Ptr(comps + (ulong)c * 8, false);
+                                        if (compPtr != 0)
+                                        {
+                                            string ccls = GameReader.ClassName(compPtr);
+                                            Console.WriteLine($"      Comp[{c}]: 0x{compPtr:X} ({ccls})");
+                                        }
+                                    }
+                                }
+
+                                ulong camTr = Mem.Ptr(camGo + 0x60, false);
+                                Console.WriteLine($"    Camera Transform (camGo+0x60): 0x{camTr:X} ({GameReader.ClassName(camTr)})");
+                                if (camTr != 0)
+                                {
+                                    ulong natTr = Mem.Ptr(camTr + 0x10, false);
+                                    Console.WriteLine($"      natTr (camTr+0x10): 0x{natTr:X}");
+                                    if (natTr != 0)
+                                    {
+                                        ulong hier2 = Mem.Ptr(natTr + 0x28, false);
+                                        int idx2 = Mem.Val<int>(natTr + 0x30, false);
+                                        Console.WriteLine($"      camTr Hierarchy: 0x{hier2:X}, Index: {idx2}");
+                                        if (hier2.IsValidVirtualAddress())
+                                        {
+                                            int cap2 = Mem.Val<int>(hier2 + 0x10, false);
+                                            ulong verts2 = Mem.Ptr(hier2 + 0x18, false);
+                                            ulong inds2 = Mem.Ptr(hier2 + 0x20, false);
+                                            Console.WriteLine($"      camTr Cap: {cap2}, Verts: 0x{verts2:X}, Inds: 0x{inds2:X}");
+                                            if (verts2.IsValidVirtualAddress() && inds2.IsValidVirtualAddress())
+                                            {
+                                                int parent2 = Mem.Val<int>(inds2 + (ulong)idx2 * 4, false);
+                                                var myTrs2 = Mem.Val<UnityTransform.TrsX>(verts2 + (ulong)idx2 * (ulong)System.Runtime.CompilerServices.Unsafe.SizeOf<UnityTransform.TrsX>(), false);
+                                                Console.WriteLine($"      camTr Node[{idx2}]: parent={parent2}, t={myTrs2.t}, q={myTrs2.q}, s={myTrs2.s}");
+                                                if (parent2 >= 0)
+                                                {
+                                                    var parentTrs2 = Mem.Val<UnityTransform.TrsX>(verts2 + (ulong)parent2 * (ulong)System.Runtime.CompilerServices.Unsafe.SizeOf<UnityTransform.TrsX>(), false);
+                                                    int gp2 = Mem.Val<int>(inds2 + (ulong)parent2 * 4, false);
+                                                    Console.WriteLine($"      camTr Parent[{parent2}]: parent={gp2}, t={parentTrs2.t}, q={parentTrs2.q}, s={parentTrs2.s}");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (curCam != 0)
+                {
+                    Console.WriteLine($"  _currentCamera: 0x{curCam:X} ({GameReader.ClassName(curCam)})");
+                    ulong curCamNat = Mem.Ptr(curCam + 0x10, false);
+                    ulong curCamGo = (curCamNat != 0) ? Mem.Ptr(curCamNat + 0x18, false) : 0;
+                    Console.WriteLine($"    _currentCamera nat: 0x{curCamNat:X}, GameObject: 0x{curCamGo:X}");
+                    if (curCamNat != 0)
+                    {
+                        byte[] rawTr = new byte[0x80];
+                        DmaMemory.ReadBuffer<byte>(curCamNat, rawTr.AsSpan(), false);
+                        Console.WriteLine($"    _currentCamera natTr bytes at 0x{curCamNat:X}:");
+                        ulong hier = BitConverter.ToUInt64(rawTr, 0x28);
+                        int trIndex = BitConverter.ToInt32(rawTr, 0x30);
+                        Console.WriteLine($"    --> Hierarchy: 0x{hier:X}, Index: {trIndex}");
+                        if (hier.IsValidVirtualAddress())
+                        {
+                            int cap = Mem.Val<int>(hier + 0x10, false);
+                            ulong verts = Mem.Ptr(hier + 0x18, false);
+                            ulong inds = Mem.Ptr(hier + 0x20, false);
+                            Console.WriteLine($"    --> Cap: {cap}, Verts: 0x{verts:X}, Inds: 0x{inds:X}");
+                            if (verts.IsValidVirtualAddress() && inds.IsValidVirtualAddress())
+                            {
+                                int parent = Mem.Val<int>(inds + (ulong)trIndex * 4, false);
+                                var myTrs = Mem.Val<UnityTransform.TrsX>(verts + (ulong)trIndex * (ulong)System.Runtime.CompilerServices.Unsafe.SizeOf<UnityTransform.TrsX>(), false);
+                                Console.WriteLine($"    --> Node[{trIndex}]: parent={parent}, t={myTrs.t}, q={myTrs.q}, s={myTrs.s}");
+                                Console.WriteLine($"    --> Testing write to _currentCamera TrsX.t (0x{verts + (ulong)trIndex * 48:X})...");
+                                Vector3 origT = myTrs.t;
+                                Vector3 offsetT = origT + new Vector3(0.45f, 0.35f, -2.2f);
+                                bool wTrs = Mem.TryWriteValue<Vector3>(verts + (ulong)trIndex * 48, offsetT);
+                                Console.WriteLine($"    --> Write result: {wTrs}");
+                                Thread.Sleep(150);
+                                var readTrs = Mem.Val<UnityTransform.TrsX>(verts + (ulong)trIndex * 48, false);
+                                Vector3 readMcc = Mem.Val<Vector3>(mccSf2 + 0x14, false);
+                                Console.WriteLine($"    --> After 150ms TrsX.t: {readTrs.t} (orig was {origT})");
+                                Console.WriteLine($"    --> After 150ms MCC LastPosition: {readMcc}");
+                                Mem.TryWriteValue<Vector3>(verts + (ulong)trIndex * 48, origT);
+                                Console.WriteLine($"    --> Restored TrsX.t to {origT}");
+                            }
+                        }
+                    }
+
+                    if (curCamGo != 0)
+                    {
+                        ulong comps = Mem.Ptr(curCamGo + UnityOffsets.GameObject.ComponentsOffset, false);
+                        Console.WriteLine($"    _currentCamera GameObject (0x{curCamGo:X}) Comps: 0x{comps:X}");
+                        if (comps != 0)
+                        {
+                            for (int c = 0; c < 10; c++)
+                            {
+                                ulong compPtr = Mem.Ptr(comps + (ulong)c * 8, false);
+                                if (compPtr != 0)
+                                {
+                                    string ccls = GameReader.ClassName(compPtr);
+                                    Console.WriteLine($"      Comp[{c}]: 0x{compPtr:X} ({ccls})");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        private static void DumpClassFields(string label, ulong obj)
+        {
+            if (obj == 0 || !obj.IsValidVirtualAddress()) return;
+            ulong klass = Mem.Ptr(obj, false);
+            Console.WriteLine($"\n--- DUMP FIELDS: {label} (obj=0x{obj:X}, klass=0x{klass:X}, Name={GameReader.ClassName(obj)}) ---");
+            for (ulong curK = klass; curK != 0; curK = Mem.Ptr(curK + Offsets.Il2CppClass_parent, false))
+            {
+                Console.WriteLine($"  Class: 0x{curK:X} ({GameReader.ClassName(curK)})");
+                ulong flds = Mem.Ptr(curK + Offsets.Il2CppClass_fields, false);
+                if (flds != 0)
+                {
+                    for (int i = 0; i < 64; i++)
+                    {
+                        ulong fi = flds + (ulong)i * Offsets.FieldInfo_size;
+                        ulong parent = Mem.Ptr(fi + Offsets.FieldInfo_parent, false);
+                        if (parent != curK) break;
+                        ulong namePtr = Mem.Ptr(fi + Offsets.FieldInfo_name, false);
+                        string fname = Mem.Str(namePtr, 128, false);
+                        int foff = Mem.Val<int>(fi + Offsets.FieldInfo_offset, false);
+                        float fval = (foff >= 0x10 && foff < 0x200) ? Mem.Val<float>(obj + (ulong)foff, false) : 0f;
+                        ulong pval = (foff >= 0x10 && foff < 0x200) ? Mem.Ptr(obj + (ulong)foff, false) : 0;
+                        Console.WriteLine($"    Field: {fname} @ 0x{foff:X} (float={fval:0.###}, ptr=0x{pval:X})");
                     }
                 }
             }
@@ -11040,6 +12125,8 @@ namespace ScpslApp
                 GameReader.RestoreNoSmoke();
                 GameReader.RestoreBrightness();
                 GameReader.RestoreGunFlashlight();
+                GameReader.TryRestoreInstantAds();
+                GameReader.TryRestoreTpv();
                 Log.WriteLine($"[FATAL CRASH] Unhandled Exception: {e.ExceptionObject}");
             };
 
@@ -11055,6 +12142,8 @@ namespace ScpslApp
                 GameReader.RestoreNoSmoke();
                 GameReader.RestoreBrightness();
                 GameReader.RestoreGunFlashlight();
+                GameReader.TryRestoreInstantAds();
+                GameReader.TryRestoreTpv();
             };
 
             try
