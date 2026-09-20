@@ -58,6 +58,11 @@ Latest additons - added no fog for distance + the 2 scp items, No flash (for fla
 - **no flash from flashbangs**
 - **fullbright** (pretty much just brightness options in write form)
 
+**FLASHLIGHT MODS** 
+Beam angle - how wide flashlight is
+brightness mult - self explanatory
+throw distance - how far the light goes
+
 
 ### 🔧 Diagnostics & Menu
 - **Dual-Column Modern Menu** — Clean layout with Player/World ESP on the left and Item ESP / Filtering on the right (`F1` / `Insert`)
