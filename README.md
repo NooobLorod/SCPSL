@@ -1,8 +1,6 @@
 # SCPSL DMA
 
-A high-performance DMA-based (Direct Memory Access) tool for **SCP: Secret Laboratory** built with .NET 10 and ImGui. Reads game memory through a PCIe DMA device (FPGA) to provide real-time ESP overlay and game information without injecting code or modules into the game process.
-
-> 📋 **Changelogs**: See [CHANGELOG.md](CHANGELOG.md) for full version history and release notes.
+Latest additons - added no fog for distance + the 2 scp items, No flash (for flashbangs), fullbright
 
 ---
 
