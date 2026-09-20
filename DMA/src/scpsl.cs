@@ -1651,7 +1651,8 @@ namespace ScpslApp
             _activeFlashlightOriginalCaptured ||
             _adsOriginalCaptured ||
             _tpvWasApplied ||
-            _freecamWasApplied;
+            _freecamWasApplied ||
+            _freecamVmCollapsed;
 
         // Viewmodel FOV is changed through the active viewmodel's backing data.
         // No function body, vtable, executable page, or read-only PE data is modified.
@@ -1940,10 +1941,8 @@ namespace ScpslApp
         private static float _origJumpSpeed = 0f;
 
         // Viewmodel hiding state
-        private static bool _freecamVmCaptured = false;
-        private static ulong _freecamVmRootTrs = 0;
-        private static Vector3 _origVmRootScale = Vector3.One;
-        private static Vector3 _origVmRootPos = Vector3.Zero;
+        private static bool _freecamVmCollapsed = false;
+        private static long _lastVmHealTicks = 0;
 
 
         // HDRP Volume Scanning & Restoration Structures
@@ -6487,39 +6486,36 @@ namespace ScpslApp
             return true;
         }
 
+        public static bool TryRestoreViewmodelRoot()
+        {
+            if (!TryResolveViewmodelRootTrs(out ulong trs)) return false;
+
+            Vector3 curScale = Mem.Val<Vector3>(trs + 0x20, false);
+            Vector3 curPos = Mem.Val<Vector3>(trs + 0x00, false);
+
+            if (curScale.X < 0.5f || curPos.Y < -10.0f)
+            {
+                Mem.TryWriteValue<Vector3>(trs + 0x20, Vector3.One);
+                Mem.TryWriteValue<Vector3>(trs + 0x00, Vector3.Zero);
+            }
+            _freecamVmCollapsed = false;
+            return true;
+        }
+
         private static void PollFreecamViewmodel(ulong localHub, bool hide)
         {
             if (!hide)
             {
-                if (_freecamVmCaptured && _freecamVmRootTrs != 0)
-                {
-                    Vector3 restoreScale = (_origVmRootScale.LengthSquared() > 0.01f) ? _origVmRootScale : Vector3.One;
-                    Mem.TryWriteValue<Vector3>(_freecamVmRootTrs + 0x20, restoreScale);
-                    Mem.TryWriteValue<Vector3>(_freecamVmRootTrs + 0x00, _origVmRootPos);
-                }
-                _freecamVmCaptured = false;
-                _freecamVmRootTrs = 0;
+                TryRestoreViewmodelRoot();
                 return;
             }
 
-            if (_freecamVmRootTrs == 0)
-            {
-                if (TryResolveViewmodelRootTrs(out ulong trs))
-                {
-                    _freecamVmRootTrs = trs;
-                    Vector3 sc = Mem.Val<Vector3>(trs + 0x20, false);
-                    Vector3 ps = Mem.Val<Vector3>(trs + 0x00, false);
-                    if (sc.LengthSquared() > 0.01f) _origVmRootScale = sc;
-                    _origVmRootPos = ps;
-                    _freecamVmCaptured = true;
-                }
-            }
-
-            if (_freecamVmRootTrs != 0)
+            if (TryResolveViewmodelRootTrs(out ulong trs))
             {
                 // Collapse viewmodel root scale to 0.0001f and translate down 500m to eliminate viewmodel
-                Mem.TryWriteValue<Vector3>(_freecamVmRootTrs + 0x20, new Vector3(0.0001f, 0.0001f, 0.0001f));
-                Mem.TryWriteValue<Vector3>(_freecamVmRootTrs + 0x00, new Vector3(0f, -500f, 0f));
+                Mem.TryWriteValue<Vector3>(trs + 0x20, new Vector3(0.0001f, 0.0001f, 0.0001f));
+                Mem.TryWriteValue<Vector3>(trs + 0x00, new Vector3(0f, -500f, 0f));
+                _freecamVmCollapsed = true;
             }
         }
 
@@ -6527,7 +6523,7 @@ namespace ScpslApp
         {
             lock (_freecamLock)
             {
-                if (_freecamWasApplied || FreecamActive)
+                if (_freecamWasApplied || FreecamActive || _freecamVmCollapsed)
                 {
                     Interlocked.Increment(ref _restoringCounter);
                     try
@@ -6549,13 +6545,8 @@ namespace ScpslApp
                             Mem.TryWriteValue<float>(_cachedFpcModule + _cachedJumpSpeedOffset, _origJumpSpeed);
                         }
 
-                        // 3. Restore viewmodel root
-                        if (_freecamVmCaptured && _freecamVmRootTrs != 0)
-                        {
-                            Vector3 restoreScale = (_origVmRootScale.LengthSquared() > 0.01f) ? _origVmRootScale : Vector3.One;
-                            Mem.TryWriteValue<Vector3>(_freecamVmRootTrs + 0x20, restoreScale);
-                            Mem.TryWriteValue<Vector3>(_freecamVmRootTrs + 0x00, _origVmRootPos);
-                        }
+                        // 3. Restore viewmodel root to clean rest pose (Vector3.One scale, Vector3.Zero position)
+                        TryRestoreViewmodelRoot();
 
                         // 4. Unfreeze network sync viewangles to live angles
                         if (TryResolveMouseLook(out ulong mouseLook))
@@ -6578,8 +6569,6 @@ namespace ScpslApp
                 _freecamToggleState = false;
                 _freecamWorldOffset = Vector3.Zero;
                 _freecamSpeedsCaptured = false;
-                _freecamVmCaptured = false;
-                _freecamVmRootTrs = 0;
                 FreecamActive = false;
                 FreecamStatus = "Off";
 
@@ -6598,9 +6587,19 @@ namespace ScpslApp
             {
                 if (!MasterMemWritesEnabled || !FreecamEnabled)
                 {
-                    if (_freecamWasApplied)
+                    if (_freecamWasApplied || _freecamVmCollapsed)
                     {
                         TryRestoreFreecam();
+                    }
+                    else
+                    {
+                        // Continuous self-healing: ensure viewmodel is not stuck collapsed
+                        long healNow = Stopwatch.GetTimestamp();
+                        if ((double)(healNow - _lastVmHealTicks) / Stopwatch.Frequency > 0.5)
+                        {
+                            _lastVmHealTicks = healNow;
+                            TryRestoreViewmodelRoot();
+                        }
                     }
                     FreecamActive = false;
                     FreecamStatus = "Off";
@@ -6609,7 +6608,7 @@ namespace ScpslApp
 
                 if (!cam.Valid)
                 {
-                    if (_freecamWasApplied) TryRestoreFreecam();
+                    if (_freecamWasApplied || _freecamVmCollapsed) TryRestoreFreecam();
                     FreecamActive = false;
                     FreecamStatus = "Waiting for camera";
                     return;
@@ -6618,7 +6617,7 @@ namespace ScpslApp
                 if (localHub == 0) localHub = LocalHub();
                 if (localHub == 0)
                 {
-                    if (_freecamWasApplied) TryRestoreFreecam();
+                    if (_freecamWasApplied || _freecamVmCollapsed) TryRestoreFreecam();
                     FreecamActive = false;
                     FreecamStatus = "Waiting for player";
                     return;
@@ -6658,9 +6657,19 @@ namespace ScpslApp
 
                 if (!active)
                 {
-                    if (_freecamWasApplied)
+                    if (_freecamWasApplied || _freecamVmCollapsed)
                     {
                         TryRestoreFreecam();
+                    }
+                    else
+                    {
+                        // Continuous self-healing: ensure viewmodel is not stuck collapsed
+                        long healNow = Stopwatch.GetTimestamp();
+                        if ((double)(healNow - _lastVmHealTicks) / Stopwatch.Frequency > 0.5)
+                        {
+                            _lastVmHealTicks = healNow;
+                            TryRestoreViewmodelRoot();
+                        }
                     }
                     FreecamActive = false;
                     FreecamStatus = FreecamRequireKey ? $"Standby ({FreecamKey})" : "Off";
@@ -6814,11 +6823,24 @@ namespace ScpslApp
                 }
 
                 // 5. Dynamic counter-rotation: transform world flight offset into live head local space
-                // ReferenceHub parent only rotates horizontally around Y (Yaw). Counter-rotating strictly around Y
-                // guarantees pitch does not swing or orbit the camera, and Space/Ctrl always ascend/descend vertically.
-                Quaternion qYaw = Quaternion.CreateFromAxisAngle(Vector3.UnitY, liveYaw * (MathF.PI / 180.0f));
-                Quaternion invYaw = Quaternion.Inverse(qYaw);
-                Vector3 localOffset = Vector3.Transform(_freecamWorldOffset, invYaw);
+                // ReferenceHub parent only rotates horizontally around Y (Yaw).
+                // In Unity's left-handed coordinate system:
+                //   X_world = x_local * cos(yaw) + z_local * sin(yaw)
+                //   Z_world = -x_local * sin(yaw) + z_local * cos(yaw)
+                // Inverting this gives the exact local translation for the camera:
+                //   x_local = X_world * cos(yaw) - Z_world * sin(yaw)
+                //   y_local = Y_world
+                //   z_local = X_world * sin(yaw) + Z_world * cos(yaw)
+                // This guarantees zero orbital swinging when looking around in all 360°,
+                // and WASD flight directions remain 100% aligned with your view in all directions.
+                float yawRad = liveYaw * (MathF.PI / 180.0f);
+                float cosY = MathF.Cos(yawRad);
+                float sinY = MathF.Sin(yawRad);
+                Vector3 localOffset = new Vector3(
+                    _freecamWorldOffset.X * cosY - _freecamWorldOffset.Z * sinY,
+                    _freecamWorldOffset.Y,
+                    _freecamWorldOffset.X * sinY + _freecamWorldOffset.Z * cosY
+                );
 
                 // Write native PlayerCameraReference translation (original rest pose + counter-rotated flight offset)
                 Mem.TryWriteValue<Vector3>(_freecamActiveTranslationAddr, _freecamOrigPcrPos + localOffset);
