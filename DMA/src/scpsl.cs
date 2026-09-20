@@ -2043,8 +2043,11 @@ namespace ScpslApp
             var outList = new List<ulong>();
             if (hashset == 0) return outList;
 
-            int lastIndex = Mem.Val<int>(hashset + Offsets.HashSet_lastIndex);
-            ulong slotsArr = Mem.Ptr(hashset + Offsets.HashSet_slots);
+            // Packed read: slotsArr (+0x18, 8 bytes) and lastIndex (+0x24, 4 bytes) in single 16-byte DMA read
+            Span<byte> header = stackalloc byte[16];
+            DmaMemory.ReadBuffer<byte>(hashset + Offsets.HashSet_slots, header, false);
+            ulong slotsArr = System.Runtime.InteropServices.MemoryMarshal.Read<ulong>(header.Slice(0, 8));
+            int lastIndex = System.Runtime.InteropServices.MemoryMarshal.Read<int>(header.Slice(12, 4));
             if (slotsArr == 0 || lastIndex <= 0 || lastIndex > 8192) return outList;
 
             // Bulk read: each slot is 16 bytes (hash:4 + next:4 + value:8)
@@ -2079,13 +2082,57 @@ namespace ScpslApp
             return outList;
         }
 
+        private static ulong _cachedLocalHub = 0;
+        private static long _lastLocalHubTicks = 0;
+        private static ulong _cachedLocalHubForInv = 0;
+        private static ulong _cachedInventoryPtr = 0;
+
         public static ulong LocalHub()
         {
+            long now = Stopwatch.GetTimestamp();
+            if (_cachedLocalHub != 0 && (now - _lastLocalHubTicks) < (Stopwatch.Frequency / 5)) // 200ms cache TTL
+            {
+                return _cachedLocalHub;
+            }
+
             ulong sf = StaticFields(Offsets.ReferenceHub_TypeInfo);
             if (sf == 0) return 0;
-            byte set = Mem.Val<byte>(sf + Offsets.RH_static_localHubSet);
-            if (set == 0) return 0;
-            return Mem.Ptr(sf + Offsets.RH_static_localHub);
+
+            // Packed read: set (+0x30, 1 byte) and localHub (+0x38, 8 bytes) in single 16-byte DMA read
+            Span<byte> buf = stackalloc byte[16];
+            DmaMemory.ReadBuffer<byte>(sf + Offsets.RH_static_localHubSet, buf, false);
+            byte set = buf[0];
+            if (set == 0)
+            {
+                _cachedLocalHub = 0;
+                _lastLocalHubTicks = now;
+                return 0;
+            }
+
+            ulong hub = System.Runtime.InteropServices.MemoryMarshal.Read<ulong>(buf.Slice(8, 8));
+            _cachedLocalHub = hub;
+            _lastLocalHubTicks = now;
+            return hub;
+        }
+
+        public static ulong GetEquippedItem(ulong localHub)
+        {
+            if (localHub == 0) return 0;
+            if (_cachedLocalHubForInv != localHub || _cachedInventoryPtr == 0)
+            {
+                if (!TryReadObjectField(localHub, "inventory", out _cachedInventoryPtr))
+                {
+                    _cachedInventoryPtr = 0;
+                    return 0;
+                }
+                _cachedLocalHubForInv = localHub;
+            }
+
+            if (_cachedInventoryPtr != 0 && TryReadObjectField(_cachedInventoryPtr, "_curInstance", out ulong equipped))
+            {
+                return equipped;
+            }
+            return 0;
         }
 
         public static ulong HostHub()
@@ -7533,9 +7580,21 @@ namespace ScpslApp
         private static List<RoomInfo> _cachedRoomsList = new();
         private static DateTime _lastRoomFetch = DateTime.MinValue;
 
+        public static void ResetRoundCaches()
+        {
+            _cachedLocalHub = 0;
+            _cachedLocalHubForInv = 0;
+            _cachedInventoryPtr = 0;
+            _cachedRoomsList.Clear();
+            _cachedGenerators.Clear();
+            _cachedNativeCameraFovAddr = 0;
+            _lastRoomFetch = DateTime.MinValue;
+            _lastGenFetch = DateTime.MinValue;
+        }
+
         public static List<RoomInfo> ReadRooms()
         {
-            if ((DateTime.UtcNow - _lastRoomFetch).TotalSeconds < 5.0 && _cachedRoomsList.Count > 0)
+            if (_cachedRoomsList.Count > 0)
                 return _cachedRoomsList;
 
             ulong sf = StaticFields(Offsets.RoomIdentifier_TypeInfo);
@@ -7748,7 +7807,7 @@ namespace ScpslApp
 
         public static List<GeneratorInfo> ReadGenerators()
         {
-            if ((DateTime.UtcNow - _lastGenFetch).TotalSeconds < 3.0 && _cachedGenerators.Count > 0)
+            if (_cachedGenerators.Count >= 3 || ((DateTime.UtcNow - _lastGenFetch).TotalSeconds < 15.0 && _cachedGenerators.Count > 0))
                 return _cachedGenerators;
 
             List<ulong>? genPtrs = null;
@@ -8375,6 +8434,7 @@ namespace ScpslApp
 
             private static readonly string[] CachedRoleNames = new string[35];
             private static readonly Vector2[] CachedRoleTextSizes = new Vector2[35];
+            private static readonly string[] MenuTabs = { "Esp", "MemWrites", "Settings" };
 
             static ScpslOverlay()
             {
@@ -8573,9 +8633,9 @@ namespace ScpslApp
                     if (GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.NoFlashEnabled || GameReader.GunFlashlightEnabled || GameReader.InstantAdsEnabled || GameReader.HasPendingRestores)
                     {
                         localHub = GameReader.LocalHub();
-                        if (localHub != 0 && (GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.GunFlashlightEnabled || GameReader.InstantAdsEnabled || GameReader.HasPendingRestores) && GameReader.TryReadObjectField(localHub, "inventory", out ulong inv))
+                        if (localHub != 0 && (GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.GunFlashlightEnabled || GameReader.InstantAdsEnabled || GameReader.HasPendingRestores))
                         {
-                            GameReader.TryReadObjectField(inv, "_curInstance", out equippedItem);
+                            equippedItem = GameReader.GetEquippedItem(localHub);
                         }
                     }
 
@@ -8599,11 +8659,13 @@ namespace ScpslApp
                     }
 
                     sw.Stop();
-                    Diag.LastPosMs = sw.Elapsed.TotalMilliseconds;
-                    Diag.LastCameraMs = sw.Elapsed.TotalMilliseconds;
-                    Diag.Update(sw.Elapsed.TotalMilliseconds);
+                    double elapsed = sw.Elapsed.TotalMilliseconds;
+                    Diag.LastPosMs = elapsed;
+                    Diag.LastCameraMs = elapsed;
+                    Diag.Update(elapsed);
 
-                    waitTimer.AutoWait(TimeSpan.FromMilliseconds(4)); // rock-solid ~200Hz cadence with <1% CPU
+                    int waitMs = (int)Math.Max(1, 5 - elapsed);
+                    waitTimer.AutoWait(TimeSpan.FromMilliseconds(waitMs));
                 }
             }
 
@@ -8682,6 +8744,7 @@ namespace ScpslApp
                                 _localRoundStopwatch.Reset();
                                 _roundEndConsecutiveTicks = 0;
                                 _roundStartConsecutiveTicks = 0;
+                                GameReader.ResetRoundCaches();
                                 MemDMABase.OnRoundEnded();
                                 DmaBase.DMA.Features.IFeature.DispatchRoundEnd();
                                 GameReader.RestoreViewangleAim();
@@ -8711,6 +8774,7 @@ namespace ScpslApp
                                 _localRoundStopwatch.Restart();
                                 _roundStartConsecutiveTicks = 0;
                                 _roundEndConsecutiveTicks = 0;
+                                GameReader.ResetRoundCaches();
                                 MemDMABase.OnRoundStarted();
                                 DmaBase.DMA.Features.IFeature.DispatchRoundStart();
                                 Log.WriteLine("[DMA] SCP:SL Round Started!");
@@ -9941,12 +10005,10 @@ namespace ScpslApp
                             ImGui.Spacing();
 
                             // Navigation Tab Buttons (Original Names)
-                            string[] tabs = { "Esp", "MemWrites", "Settings" };
-
-                            for (int i = 0; i < tabs.Length; i++)
+                            for (int i = 0; i < MenuTabs.Length; i++)
                             {
                                 bool isSelected = (_selectedTab == i);
-                                if (SidebarTabButton(tabs[i], isSelected, new Vector2(108, 34)))
+                                if (SidebarTabButton(MenuTabs[i], isSelected, new Vector2(108, 34)))
                                 {
                                     _selectedTab = i;
                                 }
@@ -10867,7 +10929,6 @@ namespace ScpslApp
                     bool roundStarted = _latestRoundStarted;
                     var deadHubs = _latestDeadHubs;
                     var aliveInfo = _latestAliveInfo;
-                    ulong localHub = LocalHub();
 
                     for (int i = 0; i < players.Count; i++)
                     {
@@ -11116,9 +11177,9 @@ namespace ScpslApp
 
                     if (!cam.Valid) return;
 
-                    // Determine current zone based on closest room
+                    // Determine current zone based on closest room (only needed when zone filters are active)
                     FacilityZone localZone = FacilityZone.None;
-                    if (rooms != null && rooms.Count > 0)
+                    if ((_roomCurrentZoneOnly || _genCurrentZoneOnly) && rooms != null && rooms.Count > 0)
                     {
                         float minDistSq = float.MaxValue;
                         for (int i = 0; i < rooms.Count; i++)
@@ -11213,11 +11274,11 @@ namespace ScpslApp
                             var item = snapshot.Pickups[i];
                             if (item.Position == Vector3.Zero) continue;
 
-                            // Apply filtering rules (Category, Armor, Ammo, Keycard, Utility)
-                            if (!ShouldRenderPickup(item, inv)) continue;
-
                             float distSq = Vector3.DistanceSquared(cam.Position, item.Position);
                             if (distSq > itemMaxDistSq) continue;
+
+                            // Apply filtering rules (Category, Armor, Ammo, Keycard, Utility)
+                            if (!ShouldRenderPickup(item, inv)) continue;
 
                             Vector3 drawPos = item.Position + new Vector3(0, 0.15f, 0);
                             if (camFrame.Project(drawPos, out float ix, out float iy))
@@ -11355,6 +11416,18 @@ namespace ScpslApp
                             drawList.AddRectFilled(new Vector2(bx - 6, hy + (height - barH)), new Vector2(bx - 3, hy + height), ColGreen);
                         }
 
+                        // Pre-calculate distance label once for nametag and SCP icon offset
+                        if (_nameTags)
+                        {
+                            int distInt = (int)MathF.Sqrt(distSq);
+                            if (distInt != p.CachedDistanceInt || p.CachedDistanceLabel.Length == 0)
+                            {
+                                p.CachedDistanceInt = distInt;
+                                p.CachedDistanceLabel = $"{p.Name} [{distInt}m]";
+                                p.CachedLabelSize = ImGui.CalcTextSize(p.CachedDistanceLabel);
+                            }
+                        }
+
                         // SCP Class Icon
                         if (_showScpIcons && (p.Team == Team.SCPs || p.Team == Team.Flamingos))
                         {
@@ -11365,14 +11438,6 @@ namespace ScpslApp
                                 float iconY = hy - 4f - iconDim;
                                 if (_nameTags)
                                 {
-                                    float dist = MathF.Sqrt(distSq);
-                                    int distInt = (int)dist;
-                                    if (distInt != p.CachedDistanceInt || p.CachedDistanceLabel.Length == 0)
-                                    {
-                                        p.CachedDistanceInt = distInt;
-                                        p.CachedDistanceLabel = $"{p.Name} [{distInt}m]";
-                                        p.CachedLabelSize = ImGui.CalcTextSize(p.CachedDistanceLabel);
-                                    }
                                     iconY = hy - p.CachedLabelSize.Y - 6f - iconDim;
                                 }
 
@@ -11385,14 +11450,6 @@ namespace ScpslApp
                         // Player Name Label
                         if (_nameTags)
                         {
-                            float dist = MathF.Sqrt(distSq);
-                            int distInt = (int)dist;
-                            if (distInt != p.CachedDistanceInt || p.CachedDistanceLabel.Length == 0)
-                            {
-                                p.CachedDistanceInt = distInt;
-                                p.CachedDistanceLabel = $"{p.Name} [{distInt}m]";
-                                p.CachedLabelSize = ImGui.CalcTextSize(p.CachedDistanceLabel);
-                            }
                             drawList.AddText(new Vector2(hx - p.CachedLabelSize.X / 2f, hy - p.CachedLabelSize.Y - 2), ColWhite, p.CachedDistanceLabel);
 
                             // Role Label
