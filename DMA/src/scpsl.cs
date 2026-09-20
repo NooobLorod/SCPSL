@@ -9679,9 +9679,13 @@ namespace ScpslApp
                     catch { }
 
                     string? exe = Environment.ProcessPath;
-                    if (string.IsNullOrEmpty(exe))
+                    if (string.IsNullOrEmpty(exe) || !File.Exists(exe))
                     {
                         try { exe = Process.GetCurrentProcess().MainModule?.FileName; } catch { }
+                    }
+                    if (string.IsNullOrEmpty(exe) || !File.Exists(exe))
+                    {
+                        exe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "SCPSLDMA.exe");
                     }
 
                     if (!string.IsNullOrEmpty(exe) && File.Exists(exe))
@@ -9696,21 +9700,22 @@ namespace ScpslApp
                             ? $"start \"\" \"{exe}\""
                             : $"start \"\" \"{exe}\" {rawArgs}";
 
-                        string extraCleanup = "";
-                        if (deleteConfig) extraCleanup += " & if exist config.json del /f /q config.json";
-                        if (deleteMmap) extraCleanup += " & if exist mmap.txt del /f /q mmap.txt";
-                        extraCleanup += " & if exist imgui.ini del /f /q imgui.ini";
+                        Log.WriteLine($"[Restart] Spawning detached relauncher for: {exe}");
 
                         var psi = new ProcessStartInfo
                         {
                             FileName = "cmd.exe",
-                            Arguments = $"/c timeout /t 1 /nobreak >nul{extraCleanup} & {startCmd}",
-                            CreateNoWindow = true,
-                            UseShellExecute = false,
-                            WorkingDirectory = workingDir
+                            Arguments = $"/c ping 127.0.0.1 -n 2 >nul & {startCmd}",
+                            WorkingDirectory = workingDir,
+                            UseShellExecute = true,
+                            WindowStyle = ProcessWindowStyle.Hidden
                         };
 
                         Process.Start(psi);
+                    }
+                    else
+                    {
+                        Log.WriteLine($"[Restart Error] Could not find executable to restart: {exe}");
                     }
                 }
                 catch (Exception ex)
