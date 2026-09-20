@@ -1647,12 +1647,18 @@ namespace ScpslApp
         public static string ViewmodelFovStatus { get; private set; } = "Off";
 
         private static readonly object _viewmodelFovLock = new();
+        private static ulong _activeViewmodelItem;
         private static ulong _activeViewmodelObject;
         private static ulong _activeViewmodelClass;
         private static ulong _activeViewmodelFovAddress;
         private static float _activeViewmodelOriginalFov;
         private static bool _activeViewmodelOriginalCaptured;
         private static int _viewmodelFovRestoreFailures = 0;
+        private static ulong _lastCheckedVmItem;
+        private static bool _lastVmItemHadViewmodel;
+        private static long _lastVmVerifyTicks;
+        private static float _lastAppliedVmTarget;
+        private static bool _vmApplied;
 
         // World Camera FOV & Hold-to-Zoom Changer.
         // Pure data-only write to native Unity::Camera and Unity::Behaviour on the heap.
@@ -1675,6 +1681,9 @@ namespace ScpslApp
         private static bool _activeWorldOriginalCaptured;
         private static float _activeWorldFovValue = 70.0f;
         private static int _worldFovRestoreFailures = 0;
+        private static long _lastWorldFovVerifyTicks;
+        private static float _lastAppliedWorldFov;
+        private static bool _worldFovApplied;
 
         public static float ActiveWorldFov
         {
@@ -1748,13 +1757,17 @@ namespace ScpslApp
         public static string ViewangleAimStatus { get; private set; } = "Off";
         private static bool _aimbotToggleActive = false;
         private static readonly object _aimbotLock = new();
+        private static ulong _cachedMouseLookAddr;
 
         private static readonly object _bunnyhopLock = new();
         private static ulong _activeJumpControllerObject;
         private static ulong _activeJumpControllerClass;
         private static ulong _activeRequestedJumpAddress;
+        private static ulong _activeSyncGroundedAddr;
+        private static ulong _activeIsJumpingAddr;
         private static bool _activeRequestedJumpOriginal;
         private static bool _activeJumpOriginalCaptured;
+        private static bool _bunnyhopJumpSent;
 
         // No Flash
         public static bool NoFlashEnabled = false;
@@ -1764,6 +1777,7 @@ namespace ScpslApp
         private static ulong _cachedFlashedEffect;
         private static ulong _cachedFogControlEffect;
         private static ulong _cachedConcussedEffect;
+        private static long _lastEffectsResolveTicks;
 
         // No Fog (formerly Less Fog / Smoke)
         public static bool LessFogEnabled = false;
@@ -1851,6 +1865,8 @@ namespace ScpslApp
         private static bool _adsOriginalCaptured;
         private static bool _adsApplied;
         private static long _lastAdsVerifyTicks;
+        private static ulong _lastCheckedAdsItem;
+        private static bool _lastAdsItemHadExtension;
 
         // Third-Person View (TPV) / Corner Peek Mode
         public static bool TpvEnabled = false;
@@ -1870,6 +1886,7 @@ namespace ScpslApp
         private static Vector3 _origPcrTranslation = Vector3.Zero;
         private static bool _tpvOrigCaptured = false;
         private static ulong _tpvActiveHub = 0;
+        private static Vector3 _lastWrittenTpvOffset = Vector3.Zero;
 
 
         // HDRP Volume Scanning & Restoration Structures
@@ -2492,6 +2509,8 @@ namespace ScpslApp
         }
 
         private static bool TryResolveActiveViewmodelFov(
+            ulong localHub,
+            ulong item,
             out ulong viewmodel,
             out ulong fovAddress,
             out float dynamicFovOffset,
@@ -2502,23 +2521,26 @@ namespace ScpslApp
             dynamicFovOffset = 0f;
             failure = "Viewmodel unavailable";
 
-            ulong localHub = LocalHub();
+            if (localHub == 0) localHub = LocalHub();
             if (localHub == 0)
             {
                 failure = "Waiting for local player";
                 return false;
             }
 
-            if (!TryReadObjectField(localHub, "inventory", out ulong inventory))
+            if (item == 0)
             {
-                failure = "Inventory unavailable";
-                return false;
-            }
+                if (!TryReadObjectField(localHub, "inventory", out ulong inventory))
+                {
+                    failure = "Inventory unavailable";
+                    return false;
+                }
 
-            if (!TryReadObjectField(inventory, "_curInstance", out ulong item))
-            {
-                failure = "No equipped item";
-                return false;
+                if (!TryReadObjectField(inventory, "_curInstance", out item))
+                {
+                    failure = "No equipped item";
+                    return false;
+                }
             }
 
             if (!TryReadObjectField(item, "ViewModel", out viewmodel))
@@ -2568,11 +2590,15 @@ namespace ScpslApp
 
         private static void ClearActiveViewmodelFovState()
         {
+            _activeViewmodelItem = 0;
             _activeViewmodelFovAddress = 0;
             _activeViewmodelObject = 0;
             _activeViewmodelClass = 0;
             _activeViewmodelOriginalFov = 0f;
             _activeViewmodelOriginalCaptured = false;
+            _lastCheckedVmItem = 0;
+            _lastVmItemHadViewmodel = false;
+            _vmApplied = false;
         }
 
         private static bool TryRestoreActiveViewmodelFov()
@@ -2637,27 +2663,85 @@ namespace ScpslApp
             }
         }
 
-        public static void PollViewmodelFov()
+        public static void PollViewmodelFov(ulong localHub = 0, ulong item = 0)
         {
             lock (_viewmodelFovLock)
             {
                 if (!MasterMemWritesEnabled || !ViewmodelFovChangerEnabled)
                 {
+                    _lastCheckedVmItem = 0;
+                    _lastVmItemHadViewmodel = false;
+                    _vmApplied = false;
                     ViewmodelFovStatus = TryRestoreActiveViewmodelFov()
                         ? "Off"
                         : "Restore blocked";
                     return;
                 }
 
+                if (localHub == 0) localHub = LocalHub();
+                if (localHub == 0)
+                {
+                    _lastCheckedVmItem = 0;
+                    _lastVmItemHadViewmodel = false;
+                    _vmApplied = false;
+                    TryRestoreActiveViewmodelFov();
+                    ViewmodelFovStatus = "Waiting for local player";
+                    return;
+                }
+
+                if (item == 0)
+                {
+                    if (!TryReadObjectField(localHub, "inventory", out ulong inventory))
+                    {
+                        _lastCheckedVmItem = 0;
+                        _lastVmItemHadViewmodel = false;
+                        _vmApplied = false;
+                        TryRestoreActiveViewmodelFov();
+                        ViewmodelFovStatus = "Inventory unavailable";
+                        return;
+                    }
+                    TryReadObjectField(inventory, "_curInstance", out item);
+                }
+
+                if (item == 0)
+                {
+                    _lastCheckedVmItem = 0;
+                    _lastVmItemHadViewmodel = false;
+                    _vmApplied = false;
+                    TryRestoreActiveViewmodelFov();
+                    ViewmodelFovStatus = "No equipped item";
+                    return;
+                }
+
+                // If equipped item has not changed and previously had no viewmodel, skip resolving
+                if (item == _lastCheckedVmItem && !_lastVmItemHadViewmodel && _activeViewmodelObject == 0)
+                {
+                    ViewmodelFovStatus = "Equipped item has no viewmodel";
+                    return;
+                }
+
                 float target = Math.Clamp(CustomViewmodelFov, 30.0f, 140.0f);
                 CustomViewmodelFov = target;
+                long now = Stopwatch.GetTimestamp();
+
+                // If already applied and item unchanged, throttle verification reads to 10 Hz
+                if (_vmApplied && item == _activeViewmodelItem && _activeViewmodelObject != 0 && Math.Abs(target - _lastAppliedVmTarget) <= 0.001f)
+                {
+                    if (now - _lastVmVerifyTicks < (Stopwatch.Frequency / 10))
+                        return;
+                }
 
                 if (!TryResolveActiveViewmodelFov(
+                    localHub,
+                    item,
                     out ulong viewmodel,
                     out ulong fovAddress,
                     out float dynamicFovOffset,
                     out string failure))
                 {
+                    _lastCheckedVmItem = item;
+                    _lastVmItemHadViewmodel = false;
+                    _vmApplied = false;
                     if (!TryRestoreActiveViewmodelFov())
                     {
                         ViewmodelFovStatus = "Restore blocked";
@@ -2667,6 +2751,9 @@ namespace ScpslApp
                     ViewmodelFovStatus = failure;
                     return;
                 }
+
+                _lastCheckedVmItem = item;
+                _lastVmItemHadViewmodel = true;
 
                 if (_activeViewmodelFovAddress != fovAddress ||
                     _activeViewmodelObject != viewmodel)
@@ -2684,6 +2771,7 @@ namespace ScpslApp
                         return;
                     }
 
+                    _activeViewmodelItem = item;
                     _activeViewmodelObject = viewmodel;
                     _activeViewmodelClass = Mem.Ptr(viewmodel, false);
                     _activeViewmodelFovAddress = fovAddress;
@@ -2698,6 +2786,7 @@ namespace ScpslApp
                     return;
                 }
 
+                _lastVmVerifyTicks = now;
                 float current = Mem.Val<float>(fovAddress, false);
                 if (Math.Abs(current - desiredBackingValue) > 0.001f)
                 {
@@ -2708,13 +2797,14 @@ namespace ScpslApp
                     }
 
                     float verified = Mem.Val<float>(fovAddress, false);
-                    ViewmodelFovStatus =
-                        Math.Abs(verified - desiredBackingValue) <= 0.001f
-                            ? "Applied (data only)"
-                            : "Write verification failed";
+                    _vmApplied = Math.Abs(verified - desiredBackingValue) <= 0.001f;
+                    _lastAppliedVmTarget = target;
+                    ViewmodelFovStatus = _vmApplied ? "Applied (data only)" : "Write verification failed";
                 }
                 else
                 {
+                    _vmApplied = true;
+                    _lastAppliedVmTarget = target;
                     ViewmodelFovStatus = "Applied (data only)";
                 }
             }
@@ -2887,6 +2977,9 @@ namespace ScpslApp
             _activeWorldOriginalFov = Offsets.DefaultVerticalFOV;
             _activeWorldOriginalCaptured = false;
             _activeWorldFovValue = Offsets.DefaultVerticalFOV;
+            _lastWorldFovVerifyTicks = 0;
+            _lastAppliedWorldFov = 0;
+            _worldFovApplied = false;
         }
 
         private static bool TryRestoreActiveWorldFov()
@@ -2984,6 +3077,14 @@ namespace ScpslApp
                     : Math.Clamp(CustomWorldFov, 60.0f, 120.0f);
 
                 _activeWorldFovValue = target;
+                long now = Stopwatch.GetTimestamp();
+
+                // If already applied and target FOV hasn't changed, throttle verification reads to 10 Hz
+                if (_worldFovApplied && Math.Abs(target - _lastAppliedWorldFov) <= 0.001f && _activeWorldFovAddress != 0)
+                {
+                    if (now - _lastWorldFovVerifyTicks < (Stopwatch.Frequency / 10))
+                        return;
+                }
 
                 ulong singleton = _activeWorldSingleton;
                 ulong realCameraObj = _activeWorldCameraObj;
@@ -3051,11 +3152,13 @@ namespace ScpslApp
                 }
 
                 // Write custom FOV to real native Camera structure
+                _lastWorldFovVerifyTicks = now;
                 float currentFov = Mem.Val<float>(fovAddress, false);
                 if (Math.Abs(currentFov - target) > 0.001f)
                 {
                     if (!Mem.TryWriteValue<float>(fovAddress, target))
                     {
+                        _worldFovApplied = false;
                         WorldFovStatus = "Write blocked (FOV)";
                         return;
                     }
@@ -3065,12 +3168,16 @@ namespace ScpslApp
                     }
 
                     float verifiedFov = Mem.Val<float>(fovAddress, false);
-                    WorldFovStatus = Math.Abs(verifiedFov - target) <= 0.001f
+                    _worldFovApplied = Math.Abs(verifiedFov - target) <= 0.001f;
+                    _lastAppliedWorldFov = target;
+                    WorldFovStatus = _worldFovApplied
                         ? (isZooming ? "Zooming" : "Applied")
                         : "Write verification failed";
                 }
                 else
                 {
+                    _worldFovApplied = true;
+                    _lastAppliedWorldFov = target;
                     WorldFovStatus = isZooming ? "Zooming" : "Applied";
                 }
             }
@@ -3969,10 +4076,12 @@ namespace ScpslApp
             }
 
             bool hasSyncGrounded = TryGetFieldOffset(fpmKlass, "_syncGrounded", out ulong syncGroundedOffset);
-            bool syncGrounded = hasSyncGrounded && (Mem.Val<byte>(fpcModule + syncGroundedOffset, false) != 0);
+            _activeSyncGroundedAddr = hasSyncGrounded ? (fpcModule + syncGroundedOffset) : 0;
+            bool syncGrounded = hasSyncGrounded && (Mem.Val<byte>(_activeSyncGroundedAddr, false) != 0);
 
             bool hasIsJumping = TryGetFieldOffset(jcKlass, "<IsJumping>k__BackingField", out ulong isJumpingOffset);
-            bool isJumping = hasIsJumping && (Mem.Val<byte>(jumpController + isJumpingOffset, false) != 0);
+            _activeIsJumpingAddr = hasIsJumping ? (jumpController + isJumpingOffset) : 0;
+            bool isJumping = hasIsJumping && (Mem.Val<byte>(_activeIsJumpingAddr, false) != 0);
 
             isGrounded = hasSyncGrounded ? (syncGrounded && !isJumping) : !isJumping;
             return true;
@@ -3983,8 +4092,11 @@ namespace ScpslApp
             _activeJumpControllerObject = 0;
             _activeJumpControllerClass = 0;
             _activeRequestedJumpAddress = 0;
+            _activeSyncGroundedAddr = 0;
+            _activeIsJumpingAddr = 0;
             _activeRequestedJumpOriginal = false;
             _activeJumpOriginalCaptured = false;
+            _bunnyhopJumpSent = false;
         }
 
         private static bool TryRestoreBunnyhop()
@@ -4034,39 +4146,6 @@ namespace ScpslApp
                     return;
                 }
 
-                if (!TryResolveJumpController(
-                    out ulong jumpController,
-                    out ulong requestedJumpAddr,
-                    out bool isGrounded,
-                    out string failure))
-                {
-                    if (!TryRestoreBunnyhop())
-                    {
-                        AutoBunnyhopStatus = "Restore blocked";
-                        return;
-                    }
-
-                    AutoBunnyhopStatus = failure;
-                    return;
-                }
-
-                if (_activeJumpControllerObject != jumpController ||
-                    _activeRequestedJumpAddress != requestedJumpAddr)
-                {
-                    if (!TryRestoreBunnyhop())
-                    {
-                        AutoBunnyhopStatus = "Restore blocked";
-                        return;
-                    }
-
-                    byte orig = Mem.Val<byte>(requestedJumpAddr, false);
-                    _activeJumpControllerObject = jumpController;
-                    _activeJumpControllerClass = Mem.Ptr(jumpController, false);
-                    _activeRequestedJumpAddress = requestedJumpAddr;
-                    _activeRequestedJumpOriginal = orig != 0;
-                    _activeJumpOriginalCaptured = true;
-                }
-
                 // Prefer read-only Unity InputManager over DMA (avoids window focus issues & works on 2-PC)
                 if (!UnityInput.IsConnected && DmaMemory.UnityBase != 0)
                 {
@@ -4090,38 +4169,93 @@ namespace ScpslApp
 
                 if (!isSpaceHeld)
                 {
-                    byte current = Mem.Val<byte>(requestedJumpAddr, false);
-                    if (current != 0)
+                    if (_bunnyhopJumpSent && _activeRequestedJumpAddress != 0)
                     {
-                        Mem.TryWriteValue<byte>(requestedJumpAddr, 0);
+                        Mem.TryWriteValue<byte>(_activeRequestedJumpAddress, 0);
+                        _bunnyhopJumpSent = false;
                     }
                     AutoBunnyhopStatus = UnityInput.IsConnected ? "Ready (hold space - Unity)" : "Ready (hold space)";
                     return;
                 }
 
+                // Space is held: verify or resolve JumpController
+                bool needsResolve = _activeJumpControllerObject == 0 ||
+                                    _activeRequestedJumpAddress == 0 ||
+                                    Mem.Ptr(_activeJumpControllerObject, false) != _activeJumpControllerClass;
+
+                if (needsResolve)
+                {
+                    if (!TryResolveJumpController(
+                        out ulong jumpController,
+                        out ulong requestedJumpAddr,
+                        out _,
+                        out string failure))
+                    {
+                        if (!TryRestoreBunnyhop())
+                        {
+                            AutoBunnyhopStatus = "Restore blocked";
+                            return;
+                        }
+
+                        AutoBunnyhopStatus = failure;
+                        return;
+                    }
+
+                    if (_activeJumpControllerObject != jumpController ||
+                        _activeRequestedJumpAddress != requestedJumpAddr)
+                    {
+                        if (!TryRestoreBunnyhop())
+                        {
+                            AutoBunnyhopStatus = "Restore blocked";
+                            return;
+                        }
+
+                        byte orig = Mem.Val<byte>(requestedJumpAddr, false);
+                        _activeJumpControllerObject = jumpController;
+                        _activeJumpControllerClass = Mem.Ptr(jumpController, false);
+                        _activeRequestedJumpAddress = requestedJumpAddr;
+                        _activeRequestedJumpOriginal = orig != 0;
+                        _activeJumpOriginalCaptured = true;
+                    }
+                }
+
+                // Grounded check using cached addresses
+                bool isGrounded;
+                if (_activeSyncGroundedAddr != 0)
+                {
+                    bool syncGrounded = Mem.Val<byte>(_activeSyncGroundedAddr, false) != 0;
+                    bool isJumping = _activeIsJumpingAddr != 0 && Mem.Val<byte>(_activeIsJumpingAddr, false) != 0;
+                    isGrounded = syncGrounded && !isJumping;
+                }
+                else if (_activeIsJumpingAddr != 0)
+                {
+                    isGrounded = Mem.Val<byte>(_activeIsJumpingAddr, false) == 0;
+                }
+                else
+                {
+                    isGrounded = true;
+                }
+
                 if (isGrounded)
                 {
-                    byte current = Mem.Val<byte>(requestedJumpAddr, false);
-                    if (current == 0)
+                    if (!_bunnyhopJumpSent)
                     {
-                        if (!Mem.TryWriteValue<byte>(requestedJumpAddr, 1))
+                        if (!Mem.TryWriteValue<byte>(_activeRequestedJumpAddress, 1))
                         {
                             AutoBunnyhopStatus = "Write blocked";
                             return;
                         }
-
-                        byte verified = Mem.Val<byte>(requestedJumpAddr, false);
-                        if (verified == 0)
-                        {
-                            AutoBunnyhopStatus = "Write verification failed";
-                            return;
-                        }
+                        _bunnyhopJumpSent = true;
                     }
-
                     AutoBunnyhopStatus = "Hopping (jump queued)";
                 }
                 else
                 {
+                    if (_bunnyhopJumpSent)
+                    {
+                        Mem.TryWriteValue<byte>(_activeRequestedJumpAddress, 0);
+                        _bunnyhopJumpSent = false;
+                    }
                     AutoBunnyhopStatus = "Airborne (holding space)";
                 }
             }
@@ -4172,6 +4306,17 @@ namespace ScpslApp
 
         public static bool TryResolveMouseLook(out ulong mouseLook)
         {
+            if (_cachedMouseLookAddr != 0 && _cachedMouseLookAddr.IsValidVirtualAddress())
+            {
+                ulong klass = Mem.Ptr(_cachedMouseLookAddr, false);
+                if (klass != 0 && klass.IsValidVirtualAddress())
+                {
+                    mouseLook = _cachedMouseLookAddr;
+                    return true;
+                }
+                _cachedMouseLookAddr = 0;
+            }
+
             mouseLook = 0;
 
             // 1. Direct path: static field _localInstance in FpcMouseLook_TypeInfo
@@ -4181,6 +4326,7 @@ namespace ScpslApp
                 ulong inst = Mem.Ptr(sf + Offsets.FpcMouseLook_static_localInstance, false);
                 if (inst.IsValidVirtualAddress())
                 {
+                    _cachedMouseLookAddr = inst;
                     mouseLook = inst;
                     return true;
                 }
@@ -4202,6 +4348,7 @@ namespace ScpslApp
                             ulong ml = Mem.Ptr(fpcMod + Offsets.Fpm_MouseLook, false);
                             if (ml.IsValidVirtualAddress())
                             {
+                                _cachedMouseLookAddr = ml;
                                 mouseLook = ml;
                                 return true;
                             }
@@ -4256,17 +4403,17 @@ namespace ScpslApp
                     isAimActive = true;
                 }
 
-                if (!TryResolveMouseLook(out ulong mouseLook))
-                {
-                    ViewangleAimStatus = "Waiting for first-person player";
-                    return;
-                }
-
                 if (!isAimActive)
                 {
                     ViewangleAimStatus = ViewangleAimRequireKey
                         ? (ViewangleAimKeyMode == 1 ? "Ready (toggle off)" : $"Ready (hold {ScpslOverlay.FormatKeyName(ViewangleAimKey)})")
                         : "Ready";
+                    return;
+                }
+
+                if (!TryResolveMouseLook(out ulong mouseLook))
+                {
+                    ViewangleAimStatus = "Waiting for first-person player";
                     return;
                 }
 
@@ -4277,16 +4424,29 @@ namespace ScpslApp
                 Vector3 camFwd = new Vector3(2f * (xz + wy), 2f * (yz - wx), 1f - 2f * (xx + yy));
 
                 RoleTypeId localRole = RoleTypeId.None;
-                ulong localHub = LocalHub();
-                if (localHub.IsValidVirtualAddress())
+                for (int i = 0; i < currentPlayers.Count; i++)
                 {
-                    ulong rm = Mem.Ptr(localHub + Offsets.RH_roleManager, false);
-                    if (rm.IsValidVirtualAddress())
+                    var cp = currentPlayers[i];
+                    if (cp != null && cp.IsLocal)
                     {
-                        ulong curRole = Mem.Ptr(rm + Offsets.PRM_curRole, false);
-                        if (curRole.IsValidVirtualAddress())
+                        localRole = cp.Role;
+                        break;
+                    }
+                }
+
+                if (localRole == RoleTypeId.None)
+                {
+                    ulong localHub = LocalHub();
+                    if (localHub.IsValidVirtualAddress())
+                    {
+                        ulong rm = Mem.Ptr(localHub + Offsets.RH_roleManager, false);
+                        if (rm.IsValidVirtualAddress())
                         {
-                            localRole = ReadRole(curRole);
+                            ulong curRole = Mem.Ptr(rm + Offsets.PRM_curRole, false);
+                            if (curRole.IsValidVirtualAddress())
+                            {
+                                localRole = ReadRole(curRole);
+                            }
                         }
                     }
                 }
@@ -4430,6 +4590,11 @@ namespace ScpslApp
             if (_cachedFlashedEffect != 0)
                 return;
 
+            long now = Stopwatch.GetTimestamp();
+            if (now - _lastEffectsResolveTicks < Stopwatch.Frequency)
+                return;
+            _lastEffectsResolveTicks = now;
+
             ulong pec = Mem.Ptr(localHub + Offsets.RH_playerEffectsController, false);
             if (!pec.IsValidVirtualAddress()) return;
 
@@ -4526,7 +4691,7 @@ namespace ScpslApp
             long now = Stopwatch.GetTimestamp();
             bool hasTargets = (_activeLiftGammaTargets.Count > 0 || _activeExposureTargets.Count > 0 || _activeColorAdjTargets.Count > 0 || _activeHdrpFogTargets.Count > 0);
             double elapsed = (double)(now - _lastHdrpScanTicks) / Stopwatch.Frequency;
-            if (hasTargets ? elapsed < 3.0 : elapsed < 1.0)
+            if (hasTargets ? elapsed < 3.0 : elapsed < 5.0)
             {
                 return;
             }
@@ -5911,6 +6076,8 @@ namespace ScpslApp
                     _addrAdsOutSpeed = 0;
                     _adsOriginalCaptured = false;
                     _adsApplied = false;
+                    _lastCheckedAdsItem = 0;
+                    _lastAdsItemHadExtension = false;
                     return ok1 && ok2;
                 }
                 finally
@@ -5933,6 +6100,8 @@ namespace ScpslApp
                 if (localHub == 0) localHub = LocalHub();
                 if (localHub == 0)
                 {
+                    _lastCheckedAdsItem = 0;
+                    _lastAdsItemHadExtension = false;
                     TryRestoreInstantAds();
                     InstantAdsStatus = "Waiting for player";
                     return;
@@ -5942,6 +6111,8 @@ namespace ScpslApp
                 {
                     if (!TryReadObjectField(localHub, "inventory", out ulong inv))
                     {
+                        _lastCheckedAdsItem = 0;
+                        _lastAdsItemHadExtension = false;
                         TryRestoreInstantAds();
                         InstantAdsStatus = "Inventory unavailable";
                         return;
@@ -5951,8 +6122,17 @@ namespace ScpslApp
 
                 if (item == 0)
                 {
+                    _lastCheckedAdsItem = 0;
+                    _lastAdsItemHadExtension = false;
                     TryRestoreInstantAds();
                     InstantAdsStatus = "No equipped item";
+                    return;
+                }
+
+                // If equipped item has not changed and previously had no ADS extension, skip resolving to avoid DMA bus choking
+                if (item == _lastCheckedAdsItem && !_lastAdsItemHadExtension && _activeAdsExtension == 0)
+                {
+                    InstantAdsStatus = "Weapon has no ADS extension";
                     return;
                 }
 
@@ -5971,10 +6151,15 @@ namespace ScpslApp
 
                 if (!TryResolveInstantAds(localHub, item, out ulong adsExt, out ulong inAddr, out ulong outAddr, out string fail))
                 {
+                    _lastCheckedAdsItem = item;
+                    _lastAdsItemHadExtension = false;
                     TryRestoreInstantAds();
                     InstantAdsStatus = fail;
                     return;
                 }
+
+                _lastCheckedAdsItem = item;
+                _lastAdsItemHadExtension = true;
 
                 if (_activeAdsExtension != adsExt)
                 {
@@ -6062,6 +6247,7 @@ namespace ScpslApp
                 _tpvOrigCaptured = false;
                 _tpvWasApplied = false;
                 _tpvToggleState = false;
+                _lastWrittenTpvOffset = Vector3.Zero;
                 TpvActive = false;
                 TpvStatus = "Off";
                 return true;
@@ -6154,7 +6340,11 @@ namespace ScpslApp
 
                 // Local translation offset: X = Shoulder, Y = Height, -Z = Distance behind
                 Vector3 localOffset = new Vector3(TpvShoulderOffset, TpvHeight, -TpvDistance);
-                Mem.TryWriteValue<Vector3>(_tpvActiveTranslationAddr, localOffset);
+                if (!_tpvWasApplied || localOffset != _lastWrittenTpvOffset)
+                {
+                    Mem.TryWriteValue<Vector3>(_tpvActiveTranslationAddr, localOffset);
+                    _lastWrittenTpvOffset = localOffset;
+                }
 
                 // Note: Unity's native transform hierarchy automatically propagates PlayerCameraReference's
                 // local translation down to Camera.main, and MainCameraController updates LastPosition with
@@ -7361,7 +7551,18 @@ namespace ScpslApp
 
             _lastCameraFovResolveTicks = now;
 
-            // 1. Resolve via CameraShakeController singleton -> _camera (+0x20) -> natCam (+0x10) -> +0x170 (FOV)
+            // 1. Priority: Real player camera resolved by WorldFovChanger (avoids redirected dummy camera)
+            if (_activeWorldCameraObj != 0 && _activeWorldCameraObj.IsValidVirtualAddress())
+            {
+                ulong natCam = Mem.Ptr(_activeWorldCameraObj + 0x10, false);
+                if (natCam != 0 && natCam.IsValidVirtualAddress())
+                {
+                    _cachedNativeCameraFovAddr = natCam + UnityOffsets.Camera.FOV;
+                    return _cachedNativeCameraFovAddr;
+                }
+            }
+
+            // 2. Resolve via CameraShakeController singleton -> _camera (+0x20) -> natCam (+0x10) -> +0x170 (FOV)
             ulong cscSf = StaticFields(Offsets.CameraShakeController_TypeInfo);
             if (cscSf != 0)
             {
@@ -7378,17 +7579,6 @@ namespace ScpslApp
                             return _cachedNativeCameraFovAddr;
                         }
                     }
-                }
-            }
-
-            // 2. Fallback to active world camera if resolved by WorldFovChanger
-            if (_activeWorldCameraObj != 0 && _activeWorldCameraObj.IsValidVirtualAddress())
-            {
-                ulong natCam = Mem.Ptr(_activeWorldCameraObj + 0x10, false);
-                if (natCam != 0 && natCam.IsValidVirtualAddress())
-                {
-                    _cachedNativeCameraFovAddr = natCam + UnityOffsets.Camera.FOV;
-                    return _cachedNativeCameraFovAddr;
                 }
             }
 
@@ -7590,6 +7780,15 @@ namespace ScpslApp
             _cachedNativeCameraFovAddr = 0;
             _lastRoomFetch = DateTime.MinValue;
             _lastGenFetch = DateTime.MinValue;
+            _lastCheckedVmItem = 0;
+            _lastVmItemHadViewmodel = false;
+            _lastCheckedAdsItem = 0;
+            _lastAdsItemHadExtension = false;
+            _cachedMouseLookAddr = 0;
+            _lastEffectsResolveTicks = 0;
+            _lastWorldFovVerifyTicks = 0;
+            _lastWrittenTpvOffset = Vector3.Zero;
+            _bunnyhopJumpSent = false;
         }
 
         public static List<RoomInfo> ReadRooms()
@@ -8561,11 +8760,13 @@ namespace ScpslApp
                 var thread2 = new Thread(HealthLoop) { Name = "DMA-Health", IsBackground = true };
                 var thread3 = new Thread(DiscoveryLoop) { Name = "DMA-Discovery", IsBackground = true };
                 var thread4 = new Thread(RoleLoop) { Name = "DMA-Roles", IsBackground = true };
+                var thread5 = new Thread(MemWritesLoop) { Name = "DMA-MemWrites", IsBackground = true };
 
                 thread1.Start();
                 thread2.Start();
                 thread3.Start();
                 thread4.Start();
+                thread5.Start();
             }
 
             private static void FastLoop()
@@ -8628,27 +8829,6 @@ namespace ScpslApp
                         cam = GameReader.ReadCamera();
                     }
 
-                    ulong localHub = 0;
-                    ulong equippedItem = 0;
-                    if (GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.NoFlashEnabled || GameReader.GunFlashlightEnabled || GameReader.InstantAdsEnabled || GameReader.HasPendingRestores)
-                    {
-                        localHub = GameReader.LocalHub();
-                        if (localHub != 0 && (GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.GunFlashlightEnabled || GameReader.InstantAdsEnabled || GameReader.HasPendingRestores))
-                        {
-                            equippedItem = GameReader.GetEquippedItem(localHub);
-                        }
-                    }
-
-                    GameReader.PollWorldFov();
-                    GameReader.PollViewmodelFov();
-                    GameReader.PollNoSway(localHub, equippedItem);
-                    GameReader.PollNoRecoil(localHub, equippedItem);
-                    GameReader.PollInstantAds(localHub, equippedItem);
-                    GameReader.PollGunFlashlight(localHub, equippedItem);
-                    GameReader.PollBunnyhop();
-                    GameReader.PollViewangleAim(cam, currentPlayers);
-                    GameReader.PollNoFlash(localHub);
-                    GameReader.PollTpv(ref cam, localHub);
                     UpdateCamera(cam);
 
                     // Atomically publish lock-free snapshot only when player list reference changes
@@ -8665,6 +8845,68 @@ namespace ScpslApp
                     Diag.Update(elapsed);
 
                     int waitMs = (int)Math.Max(1, 5 - elapsed);
+                    waitTimer.AutoWait(TimeSpan.FromMilliseconds(waitMs));
+                }
+            }
+
+            private static void MemWritesLoop()
+            {
+                var sw = new Stopwatch();
+                using var waitTimer = new WaitTimer();
+                while (_dmaRunning)
+                {
+                    if (ScpslMemory.Instance == null || !ScpslMemory.Instance.Ready)
+                    {
+                        Thread.Sleep(50);
+                        continue;
+                    }
+
+                    sw.Restart();
+
+                    if (GameReader.MasterMemWritesEnabled)
+                    {
+                        ulong localHub = 0;
+                        ulong equippedItem = 0;
+                        if (GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.NoFlashEnabled || GameReader.GunFlashlightEnabled || GameReader.InstantAdsEnabled || GameReader.ViewmodelFovChangerEnabled || GameReader.HasPendingRestores)
+                        {
+                            localHub = GameReader.LocalHub();
+                            if (localHub != 0 && (GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.GunFlashlightEnabled || GameReader.InstantAdsEnabled || GameReader.ViewmodelFovChangerEnabled || GameReader.HasPendingRestores))
+                            {
+                                equippedItem = GameReader.GetEquippedItem(localHub);
+                            }
+                        }
+
+                        var cam = GetLatestCamera();
+                        var currentPlayers = _currentSnapshot.Players;
+
+                        GameReader.PollWorldFov();
+                        GameReader.PollViewmodelFov(localHub, equippedItem);
+                        GameReader.PollNoSway(localHub, equippedItem);
+                        GameReader.PollNoRecoil(localHub, equippedItem);
+                        GameReader.PollInstantAds(localHub, equippedItem);
+                        GameReader.PollGunFlashlight(localHub, equippedItem);
+                        GameReader.PollBunnyhop();
+                        GameReader.PollViewangleAim(cam, currentPlayers);
+                        GameReader.PollNoFlash(localHub);
+                        GameReader.PollTpv(ref cam, localHub);
+                    }
+                    else if (GameReader.HasPendingRestores)
+                    {
+                        GameReader.PollWorldFov();
+                        GameReader.PollViewmodelFov();
+                        GameReader.PollNoSway(0, 0);
+                        GameReader.PollNoRecoil(0, 0);
+                        GameReader.PollInstantAds(0, 0);
+                        GameReader.PollGunFlashlight(0, 0);
+                        GameReader.PollBunnyhop();
+                        GameReader.PollNoFlash(0);
+                        var cam = GetLatestCamera();
+                        GameReader.PollTpv(ref cam, 0);
+                    }
+
+                    sw.Stop();
+                    double elapsed = sw.Elapsed.TotalMilliseconds;
+                    int waitMs = (int)Math.Max(1, 13 - elapsed);
                     waitTimer.AutoWait(TimeSpan.FromMilliseconds(waitMs));
                 }
             }
