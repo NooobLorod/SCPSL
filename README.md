@@ -1,6 +1,6 @@
 # SCPSL DMA
 
-Latest additons - added no fog for distance + the 2 scp items, No flash (for flashbangs), fullbright
+Latest additons - added flashlight mods (mem writes)
 
 ---
 
