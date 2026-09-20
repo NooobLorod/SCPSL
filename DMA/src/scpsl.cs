@@ -1781,7 +1781,6 @@ namespace ScpslApp
         private static ulong _activeIsJumpingAddr;
         private static bool _activeRequestedJumpOriginal;
         private static bool _activeJumpOriginalCaptured;
-        private static bool _bunnyhopJumpSent;
 
         // No Flash
         public static bool NoFlashEnabled = false;
@@ -4152,7 +4151,6 @@ namespace ScpslApp
             _activeIsJumpingAddr = 0;
             _activeRequestedJumpOriginal = false;
             _activeJumpOriginalCaptured = false;
-            _bunnyhopJumpSent = false;
         }
 
         private static bool TryRestoreBunnyhop()
@@ -4196,7 +4194,7 @@ namespace ScpslApp
         {
             lock (_bunnyhopLock)
             {
-                if (!MasterMemWritesEnabled || !AutoBunnyhopEnabled)
+                if (!MasterMemWritesEnabled || !AutoBunnyhopEnabled || FreecamActive)
                 {
                     AutoBunnyhopStatus = TryRestoreBunnyhop() ? "Off" : "Restore blocked";
                     return;
@@ -4225,10 +4223,13 @@ namespace ScpslApp
 
                 if (!isSpaceHeld)
                 {
-                    if (_bunnyhopJumpSent && _activeRequestedJumpAddress != 0)
+                    if (_activeRequestedJumpAddress != 0)
                     {
-                        Mem.TryWriteValue<byte>(_activeRequestedJumpAddress, 0);
-                        _bunnyhopJumpSent = false;
+                        byte cur = Mem.Val<byte>(_activeRequestedJumpAddress, false);
+                        if (cur != 0)
+                        {
+                            Mem.TryWriteValue<byte>(_activeRequestedJumpAddress, 0);
+                        }
                     }
                     AutoBunnyhopStatus = UnityInput.IsConnected ? "Ready (hold space - Unity)" : "Ready (hold space)";
                     return;
@@ -4275,45 +4276,22 @@ namespace ScpslApp
                     }
                 }
 
-                // Grounded check using cached addresses
-                bool isGrounded;
-                if (_activeSyncGroundedAddr != 0)
+                // While Space is held, keep _requestedJump primed (1).
+                // In SCP:SL, FpcJumpController.ProcessJump automatically consumes and resets _requestedJump to 0
+                // upon launching a jump, while UpdateFloating applies airborne gravity without consuming it.
+                // Keeping _requestedJump primed guarantees that the moment the player touches the ground,
+                // the engine's UpdateGrounded executes the next jump immediately on tick 0 with zero landing friction.
+                byte current = Mem.Val<byte>(_activeRequestedJumpAddress, false);
+                if (current == 0)
                 {
-                    bool syncGrounded = Mem.Val<byte>(_activeSyncGroundedAddr, false) != 0;
-                    bool isJumping = _activeIsJumpingAddr != 0 && Mem.Val<byte>(_activeIsJumpingAddr, false) != 0;
-                    isGrounded = syncGrounded && !isJumping;
-                }
-                else if (_activeIsJumpingAddr != 0)
-                {
-                    isGrounded = Mem.Val<byte>(_activeIsJumpingAddr, false) == 0;
-                }
-                else
-                {
-                    isGrounded = true;
+                    if (!Mem.TryWriteValue<byte>(_activeRequestedJumpAddress, 1))
+                    {
+                        AutoBunnyhopStatus = "Write blocked";
+                        return;
+                    }
                 }
 
-                if (isGrounded)
-                {
-                    if (!_bunnyhopJumpSent)
-                    {
-                        if (!Mem.TryWriteValue<byte>(_activeRequestedJumpAddress, 1))
-                        {
-                            AutoBunnyhopStatus = "Write blocked";
-                            return;
-                        }
-                        _bunnyhopJumpSent = true;
-                    }
-                    AutoBunnyhopStatus = "Hopping (jump queued)";
-                }
-                else
-                {
-                    if (_bunnyhopJumpSent)
-                    {
-                        Mem.TryWriteValue<byte>(_activeRequestedJumpAddress, 0);
-                        _bunnyhopJumpSent = false;
-                    }
-                    AutoBunnyhopStatus = "Airborne (holding space)";
-                }
+                AutoBunnyhopStatus = "Hopping (holding space)";
             }
         }
 
@@ -8285,7 +8263,6 @@ namespace ScpslApp
             _lastEffectsResolveTicks = 0;
             _lastWorldFovVerifyTicks = 0;
             _lastWrittenTpvOffset = Vector3.Zero;
-            _bunnyhopJumpSent = false;
         }
 
         public static List<RoomInfo> ReadRooms()
