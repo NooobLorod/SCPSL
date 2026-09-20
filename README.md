@@ -1,3 +1,8 @@
+
+# made by q8fz on discord
+
+
+
 # SCPSL DMA
 
 Latest additons - third person (shitty as it doesnt spawn ur model) + instant ads
