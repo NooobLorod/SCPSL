@@ -38,6 +38,10 @@ namespace DmaBase.Misc
         private static extern bool AllocConsole();
 
         [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AttachConsole(uint dwProcessId);
+        private const uint ATTACH_PARENT_PROCESS = 0xFFFFFFFF;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool FreeConsole();
 
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -92,18 +96,11 @@ namespace DmaBase.Misc
             {
                 if (GetConsoleWindow() == IntPtr.Zero)
                 {
-                    if (AllocConsole())
+                    if (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole())
                     {
                         Console.OutputEncoding = Encoding.UTF8;
                         Console.SetOut(new StreamWriter(Console.OpenStandardOutput(), Encoding.UTF8) { AutoFlush = true });
                         Console.SetError(new StreamWriter(Console.OpenStandardError(), Encoding.UTF8) { AutoFlush = true });
-                        Console.Title = "DMA Base - Debug Console";
-                        Console.ForegroundColor = ConsoleColor.Cyan;
-                        Console.WriteLine("================================================================");
-                        Console.WriteLine("                    DMA Base Debug Console                      ");
-                        Console.WriteLine("================================================================");
-                        Console.ResetColor();
-                        Console.WriteLine();
                         _consoleAllocated = true;
                     }
                 }

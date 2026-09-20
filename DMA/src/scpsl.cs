@@ -588,7 +588,7 @@ namespace ScpslApp
         public bool ViewangleAimRequireKey { get; set; } = true;
         public int ViewangleAimKeyMode { get; set; } = 0; // 0 = Hold, 1 = Toggle
 
-        // Visual Enhancements (No Flash, No Fog, Brightness)
+        // Visual Enhancements (No Flash, No Fog, Brightness, Gun Flashlight)
         public bool NoFlashEnabled { get; set; } = false;
         public bool LessFogEnabled { get; set; } = false;
         public bool FullNoFogEnabled { get; set; } = false;
@@ -596,6 +596,12 @@ namespace ScpslApp
         public bool LessFogScp244Enabled { get; set; } = false;
         public bool BrightnessEnabled { get; set; } = false;
         public float BrightnessEv { get; set; } = 1.5f;
+
+        // Gun Flashlight Enhancement
+        public bool GunFlashlightEnabled { get; set; } = false;
+        public float GunFlashlightSpotAngle { get; set; } = 80.0f;
+        public float GunFlashlightIntensityMult { get; set; } = 1.0f;
+        public float GunFlashlightRange { get; set; } = 60.0f;
 
         [JsonIgnore]
         public bool NoFogEnabled { get => LessFogEnabled; set => LessFogEnabled = value; }
@@ -612,7 +618,7 @@ namespace ScpslApp
     public sealed class ScpslConfig : IConfig
     {
         public LowLevelCache LowLevelCache { get; } = new();
-        public bool MemWritesEnabled => (GameReader.MasterMemWritesEnabled && (GameReader.WorldFovChangerEnabled || GameReader.ViewmodelFovChangerEnabled || GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.AutoBunnyhopEnabled || GameReader.ViewangleAimEnabled || GameReader.NoFlashEnabled || GameReader.NoFogEnabled || GameReader.BrightnessEnabled))
+        public bool MemWritesEnabled => (GameReader.MasterMemWritesEnabled && (GameReader.WorldFovChangerEnabled || GameReader.ViewmodelFovChangerEnabled || GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.AutoBunnyhopEnabled || GameReader.ViewangleAimEnabled || GameReader.NoFlashEnabled || GameReader.NoFogEnabled || GameReader.BrightnessEnabled || GameReader.GunFlashlightEnabled))
             || GameReader.IsRestoring
             || GameReader.HasPendingRestores;
         public int MonitorWidth => 1920;
@@ -664,7 +670,9 @@ namespace ScpslApp
                         }
                         else
                         {
-                            if (!_hVMM.PidGetFromName(_processName, out uint currentPid) || currentPid != ProcessPID)
+                            uint[] pids = _hVMM.PidGetAllFromName(_processName);
+                            bool stillAlive = pids != null && pids.Contains(ProcessPID);
+                            if (!stillAlive)
                             {
                                 Log.WriteLine($"[DMA] Target process exited (was PID {ProcessPID}). Resetting state...");
                                 ProcessPID = 0;
@@ -691,22 +699,45 @@ namespace ScpslApp
 
         private bool Attach()
         {
-            if (!_hVMM.PidGetFromName(_processName, out uint pid) || pid == 0)
+            uint[] candidatePids = _hVMM.PidGetAllFromName(_processName);
+            if (candidatePids == null || candidatePids.Length == 0)
+            {
+                if (_hVMM.PidGetFromName(_processName, out uint singlePid) && singlePid != 0)
+                    candidatePids = new uint[] { singlePid };
+                else
+                    return false;
+            }
+
+            uint selectedPid = 0;
+            ulong unityBase = 0;
+            ulong gaBase = 0;
+
+            foreach (uint pid in candidatePids)
+            {
+                if (pid == 0) continue;
+                ulong uBase = _hVMM.ProcessGetModuleBase(pid, "UnityPlayer.dll");
+                if (uBase == 0) continue;
+                ulong gBase = _hVMM.ProcessGetModuleBase(pid, "GameAssembly.dll");
+                if (gBase == 0) continue;
+
+                // Found the client!
+                selectedPid = pid;
+                unityBase = uBase;
+                gaBase = gBase;
+                break;
+            }
+
+            if (selectedPid == 0)
+            {
                 return false;
+            }
 
-            Log.WriteLine($"[DMA] Found process {_processName} with PID: {pid}");
-            ulong unityBase = _hVMM.ProcessGetModuleBase(pid, "UnityPlayer.dll");
-            if (unityBase == 0) { Log.WriteLine("[DMA] Waiting for UnityPlayer.dll..."); return false; }
-
-            ulong gaBase = _hVMM.ProcessGetModuleBase(pid, "GameAssembly.dll");
-            if (gaBase == 0) { Log.WriteLine("[DMA] Waiting for GameAssembly.dll..."); return false; }
-
-            ProcessPID = pid;
+            ProcessPID = selectedPid;
             UnityBase = unityBase;
             GameAssemblyBase = gaBase;
             MonoBase = gaBase;
 
-            Log.WriteLine($"[DMA] Attached! PID: {pid}  UnityPlayer: 0x{UnityBase:X}  GameAssembly: 0x{GameAssemblyBase:X}");
+            Log.WriteLine($"[DMA] Attached! PID: {selectedPid}  UnityPlayer: 0x{UnityBase:X}  GameAssembly: 0x{GameAssemblyBase:X}");
             var sw = Stopwatch.StartNew();
             try
             {
@@ -1230,6 +1261,14 @@ namespace ScpslApp
         public const ulong RoundSummary_roundTime = 0x38;
         public const ulong RoundSummary_isRoundEnded = 0x89;
 
+        public const ulong RoundStart_TypeInfo = 0x3F29BF0;
+        public const ulong RoundStart_static_singleton = 0x0;
+        public const ulong RoundStart_static_RoundStartTimer = 0x10;
+        public const ulong RoundStart_NetworkTimer = 0xBA;
+        public const ulong Stopwatch_elapsed = 0x10;
+        public const ulong Stopwatch_started = 0x18;
+        public const ulong Stopwatch_isRunning = 0x20;
+
         public const ulong NetworkClient_TypeInfo = 0x3F296B0;
         public const ulong NC_static_spawned = 0x10;
         public const ulong ItemPickupBase_TypeInfo = 0x3F43670;
@@ -1574,7 +1613,8 @@ namespace ScpslApp
             _origScp244Dict.Count > 0 ||
             _origLiftGammaDict.Count > 0 ||
             _origExposureDict.Count > 0 ||
-            _origColorAdjDict.Count > 0;
+            _origColorAdjDict.Count > 0 ||
+            _activeFlashlightOriginalCaptured;
 
         // Viewmodel FOV is changed through the active viewmodel's backing data.
         // No function body, vtable, executable page, or read-only PE data is modified.
@@ -1730,6 +1770,50 @@ namespace ScpslApp
         public static string BrightnessStatus { get; private set; } = "Off";
         private static readonly object _brightnessLock = new();
 
+        // Gun Flashlight Enhancement
+        public static bool GunFlashlightEnabled = false;
+        public static float GunFlashlightSpotAngle = 80.0f;
+        public static float GunFlashlightIntensityMult = 1.0f;
+        public static float GunFlashlightRange = 60.0f;
+        public static string GunFlashlightStatus { get; private set; } = "Off";
+
+        private static readonly object _gunFlashlightLock = new();
+        private static ulong _activeFlashlightViewmodelObject;
+        private static ulong _activeFlashlightLightSource;
+        private static ulong _activeFlashlightHdLightData;
+        private static ulong _activeFlashlightNativeLight;
+        private static ulong _lastCheckedFlashlightItem;
+        private static bool _lastFlashlightItemHadFlashlight;
+        private static string? _lastFlashlightFailure;
+        private static bool _flashlightApplied;
+        private static long _lastFlashlightVerifyTicks;
+        private static long _lastFlashlightRetryTicks;
+
+        // Targets for memory writes
+        private static ulong _addrFadeDistance;
+        private static ulong _addrLightDimmer;
+        private static ulong _addrIntensity;
+        private static ulong _addrInnerSpotPercent;
+        private static ulong _addrVolumetricDimmer;
+        private static ulong _addrVolumetricFadeDistance;
+        private static ulong _addrNativeIntensity;
+        private static ulong _addrNativeRange;
+        private static ulong _addrNativeSpotAngle;
+        private static ulong _addrNativeInnerSpotAngle;
+
+        // Captured original values
+        private static float _origFadeDistance;
+        private static float _origLightDimmer;
+        private static float _origIntensity;
+        private static float _origInnerSpotPercent;
+        private static float _origVolumetricDimmer;
+        private static float _origVolumetricFadeDistance;
+        private static float _origNativeIntensity;
+        private static float _origNativeRange;
+        private static float _origNativeSpotAngle;
+        private static float _origNativeInnerSpotAngle;
+        private static bool _activeFlashlightOriginalCaptured;
+
         // HDRP Volume Scanning & Restoration Structures
         private struct HdrpLiftGammaGainTarget
         {
@@ -1823,6 +1907,9 @@ namespace ScpslApp
             _activeColorAdjTargets.Clear();
             _activeHdrpFogTargets.Clear();
             _origScp244Dict.Clear();
+            ClearActiveFlashlightState();
+            _lastCheckedFlashlightItem = 0;
+            _lastFlashlightItemHadFlashlight = false;
         }
 
         // ── Cached TypeInfo read ──
@@ -1952,12 +2039,54 @@ namespace ScpslApp
             return Mem.Ptr(sf + Offsets.RH_static_hostHub);
         }
 
+        public static bool IsLocalPlayerAlive()
+        {
+            ulong localHub = LocalHub();
+            if (!localHub.IsValidVirtualAddress()) return false;
+            ulong rm = Mem.Ptr(localHub + Offsets.RH_roleManager);
+            if (!rm.IsValidVirtualAddress()) return false;
+            ulong curRole = Mem.Ptr(rm + Offsets.PRM_curRole);
+            if (!curRole.IsValidVirtualAddress()) return false;
+            RoleTypeId role = ReadRole(curRole);
+            return RoleIsAlive(role);
+        }
+
+        public static bool HasLivingPlayers(IReadOnlyList<PlayerInfo>? players)
+        {
+            if (players == null || players.Count == 0) return false;
+            for (int i = 0; i < players.Count; i++)
+            {
+                if (RoleIsAlive(players[i].Role))
+                    return true;
+            }
+            return false;
+        }
+
+        public static bool IsRoundStartTimerRunning()
+        {
+            ulong sf = StaticFields(Offsets.RoundStart_TypeInfo);
+            if (sf == 0) return false;
+            ulong swPtr = Mem.Ptr(sf + Offsets.RoundStart_static_RoundStartTimer);
+            if (!swPtr.IsValidVirtualAddress()) return false;
+            return Mem.Val<byte>(swPtr + Offsets.Stopwatch_isRunning) != 0;
+        }
+
         public static bool IsRoundStarted(IReadOnlyList<PlayerInfo>? players = null)
         {
-            // 1. Explicit round ended confirmation check from RoundSummary singleton
-            if (IsRoundEnded()) return false;
+            // 1. Authoritative: Local player is alive (Class-D, Scientist, Guard, MTF, Chaos, SCP)
+            if (IsLocalPlayerAlive()) return true;
 
-            // 2. Check LocalHub CharacterClassManager
+            // 2. Authoritative: Any snapshot player has a confirmed living role
+            if (HasLivingPlayers(players)) return true;
+
+            // 3. Authoritative: GameCore.RoundStart stopwatch is running
+            if (IsRoundStartTimerRunning()) return true;
+
+            // 4. Check RoundSummary synchronized elapsed timer (>0 means round in progress)
+            int roundTime = ReadRoundTime();
+            if (roundTime > 0) return true;
+
+            // 5. Check LocalHub CharacterClassManager
             ulong localHub = LocalHub();
             if (localHub.IsValidVirtualAddress())
             {
@@ -1968,7 +2097,7 @@ namespace ScpslApp
                 }
             }
 
-            // 3. Check HostHub CharacterClassManager (only as positive confirmation, never as false blocker)
+            // 6. Check HostHub CharacterClassManager (only as positive confirmation, never as false blocker)
             ulong hostHub = HostHub();
             if (hostHub.IsValidVirtualAddress())
             {
@@ -1979,37 +2108,51 @@ namespace ScpslApp
                 }
             }
 
-            // 4. Check RoundSummary synchronized elapsed timer (>0 means round in progress)
-            int roundTime = ReadRoundTime();
-            if (roundTime > 0)
-            {
-                return true;
-            }
-
-            // 5. Check if any player in active snapshot has a confirmed living role (Class-D, Scientist, Guard, MTF, Chaos, SCP)
-            if (players != null && players.Count > 0)
-            {
-                for (int i = 0; i < players.Count; i++)
-                {
-                    if (RoleIsAlive(players[i].Role))
-                    {
-                        return true;
-                    }
-                }
-            }
-
             return false;
         }
 
         public static int ReadRoundTime()
         {
+            // 1. Check GameCore.RoundStart.RoundStartTimer (synced client stopwatch)
+            ulong rsSf = StaticFields(Offsets.RoundStart_TypeInfo);
+            if (rsSf != 0)
+            {
+                ulong swPtr = Mem.Ptr(rsSf + Offsets.RoundStart_static_RoundStartTimer);
+                if (swPtr.IsValidVirtualAddress())
+                {
+                    bool isRunning = Mem.Val<byte>(swPtr + Offsets.Stopwatch_isRunning) != 0;
+                    if (isRunning)
+                    {
+                        long elapsed = Mem.Val<long>(swPtr + Offsets.Stopwatch_elapsed);
+                        long started = Mem.Val<long>(swPtr + Offsets.Stopwatch_started);
+                        long now = Stopwatch.GetTimestamp();
+                        long totalTicks = elapsed + (now - started);
+                        if (totalTicks > 0 && Stopwatch.Frequency > 0)
+                        {
+                            int sec = (int)(totalTicks / Stopwatch.Frequency);
+                            if (sec >= 0 && sec < 86400) return sec;
+                        }
+                    }
+                }
+            }
+
+            // 2. Check RoundSummary synchronized elapsed timer (server/host)
             ulong sf = StaticFields(Offsets.RoundSummary_TypeInfo);
-            if (sf == 0) return 0;
-            return Mem.Val<int>(sf + Offsets.RoundSummary_roundTime);
+            if (sf != 0)
+            {
+                int rTime = Mem.Val<int>(sf + Offsets.RoundSummary_roundTime);
+                if (rTime > 0 && rTime < 86400) return rTime;
+            }
+
+            return 0;
         }
 
-        public static bool IsRoundEnded()
+        public static bool IsRoundEnded(IReadOnlyList<PlayerInfo>? players = null)
         {
+            // Guard: If local player or any snapshot player is actively alive, the round CANNOT have ended!
+            if (IsLocalPlayerAlive() || HasLivingPlayers(players))
+                return false;
+
             ulong sf = StaticFields(Offsets.RoundSummary_TypeInfo);
             if (sf == 0) return false;
             byte set = Mem.Val<byte>(sf + Offsets.RoundSummary_singletonSet);
@@ -4818,6 +4961,737 @@ namespace ScpslApp
         public static void PollNoSmoke() => PollLessFog();
         public static void RestoreNoSmoke() => RestoreLessFog();
 
+        // ═══════════════════════════════════════════════════════════
+        //  GUN FLASHLIGHT ENHANCEMENT
+        // ═══════════════════════════════════════════════════════════
+        private static void ClearActiveFlashlightState()
+        {
+            _activeFlashlightViewmodelObject = 0;
+            _activeFlashlightLightSource = 0;
+            _activeFlashlightHdLightData = 0;
+            _activeFlashlightNativeLight = 0;
+            _addrFadeDistance = 0;
+            _addrLightDimmer = 0;
+            _addrIntensity = 0;
+            _addrInnerSpotPercent = 0;
+            _addrVolumetricDimmer = 0;
+            _addrVolumetricFadeDistance = 0;
+            _addrNativeIntensity = 0;
+            _addrNativeRange = 0;
+            _addrNativeSpotAngle = 0;
+            _addrNativeInnerSpotAngle = 0;
+            _origFadeDistance = 0;
+            _origLightDimmer = 0;
+            _origIntensity = 0;
+            _origInnerSpotPercent = 0;
+            _origVolumetricDimmer = 0;
+            _origVolumetricFadeDistance = 0;
+            _origNativeIntensity = 0;
+            _origNativeRange = 0;
+            _origNativeSpotAngle = 0;
+            _origNativeInnerSpotAngle = 0;
+            _activeFlashlightOriginalCaptured = false;
+            _flashlightApplied = false;
+        }
+
+        public static bool TryRestoreGunFlashlight()
+        {
+            if (!_activeFlashlightOriginalCaptured)
+            {
+                ClearActiveFlashlightState();
+                return true;
+            }
+
+            Interlocked.Increment(ref _restoringCounter);
+            try
+            {
+                if (_addrLightDimmer != 0)
+                    Mem.TryWriteValue<float>(_addrLightDimmer, _origLightDimmer);
+                if (_addrFadeDistance != 0)
+                    Mem.TryWriteValue<float>(_addrFadeDistance, _origFadeDistance);
+                if (_addrIntensity != 0 && _origIntensity > 0f)
+                    Mem.TryWriteValue<float>(_addrIntensity, _origIntensity);
+                if (_addrInnerSpotPercent != 0)
+                    Mem.TryWriteValue<float>(_addrInnerSpotPercent, _origInnerSpotPercent);
+                if (_addrVolumetricDimmer != 0)
+                    Mem.TryWriteValue<float>(_addrVolumetricDimmer, _origVolumetricDimmer);
+                if (_addrVolumetricFadeDistance != 0)
+                    Mem.TryWriteValue<float>(_addrVolumetricFadeDistance, _origVolumetricFadeDistance);
+                if (_addrNativeIntensity != 0 && _origNativeIntensity > 0f)
+                    Mem.TryWriteValue<float>(_addrNativeIntensity, _origNativeIntensity);
+                if (_addrNativeRange != 0 && _origNativeRange > 0f)
+                    Mem.TryWriteValue<float>(_addrNativeRange, _origNativeRange);
+                if (_addrNativeSpotAngle != 0 && _origNativeSpotAngle > 0f)
+                    Mem.TryWriteValue<float>(_addrNativeSpotAngle, _origNativeSpotAngle);
+                if (_addrNativeInnerSpotAngle != 0 && _origNativeInnerSpotAngle > 0f)
+                    Mem.TryWriteValue<float>(_addrNativeInnerSpotAngle, _origNativeInnerSpotAngle);
+
+                ClearActiveFlashlightState();
+                GunFlashlightStatus = "Off";
+                return true;
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _restoringCounter);
+            }
+        }
+
+        public static void RestoreGunFlashlight()
+        {
+            lock (_gunFlashlightLock)
+            {
+                TryRestoreGunFlashlight();
+            }
+        }
+
+        private static bool TryGetManagedComponent(ulong compPtr, out ulong managedObj, out string className)
+        {
+            managedObj = 0;
+            className = string.Empty;
+            if (compPtr == 0 || !compPtr.IsValidVirtualAddress()) return false;
+
+            ulong[] candidateOffsets = [0x28, 0x20, 0x30, 0x10];
+            for (int i = 0; i < candidateOffsets.Length; i++)
+            {
+                ulong candidate = Mem.Ptr(compPtr + candidateOffsets[i], false);
+                if (candidate == 0 || !candidate.IsValidVirtualAddress()) continue;
+
+                string name = ClassName(candidate);
+                if (!string.IsNullOrEmpty(name))
+                {
+                    managedObj = candidate;
+                    className = name;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static void TryScanGameObjectForLight(
+            ulong nativeGo,
+            ref ulong flashlightExt,
+            ref ulong lightSource,
+            ref ulong hdLightData,
+            ref ulong nativeLight)
+        {
+            if (nativeGo == 0 || !nativeGo.IsValidVirtualAddress()) return;
+
+            ulong compArrayBase = Mem.Ptr(nativeGo + 0x58, false);
+            ulong compSize = Mem.Val<ulong>(nativeGo + 0x68, false);
+            if (compSize == 0 || compSize > 64 || !compArrayBase.IsValidVirtualAddress()) return;
+
+            for (int c = 0; c < (int)compSize; c++)
+            {
+                ulong compPtr = Mem.Ptr(compArrayBase + (ulong)c * 16 + 8, false);
+                if (compPtr == 0 || !compPtr.IsValidVirtualAddress()) continue;
+
+                if (TryGetManagedComponent(compPtr, out ulong managedComp, out string compName))
+                {
+                    if (flashlightExt == 0 && (compName.IndexOf("FlashlightExtension", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        (compName.IndexOf("Flashlight", StringComparison.OrdinalIgnoreCase) >= 0 && compName.IndexOf("Attachment", StringComparison.OrdinalIgnoreCase) < 0)))
+                    {
+                        flashlightExt = managedComp;
+                        ulong ls = Mem.Ptr(managedComp + 0x40, false);
+                        if (ls == 0 || !ls.IsValidVirtualAddress())
+                        {
+                            TryReadObjectField(managedComp, "_lightSource", out ls);
+                        }
+                        if (ls != 0 && ls.IsValidVirtualAddress())
+                        {
+                            lightSource = ls;
+                            nativeLight = Mem.Ptr(ls + 0x10, false);
+                        }
+                    }
+                    else if (hdLightData == 0 && compName.IndexOf("HDAdditionalLightData", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        hdLightData = managedComp;
+                    }
+                    else if (compName.Equals("Light", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (lightSource == 0) lightSource = managedComp;
+                        if (nativeLight == 0) nativeLight = compPtr;
+                    }
+                }
+            }
+        }
+
+        private static ulong FindHDLightDataFromNative(ulong nativeLight, ref ulong lightSource)
+        {
+            if (nativeLight == 0 || !nativeLight.IsValidVirtualAddress()) return 0;
+
+            // In Unity, nativeLight + 0x18 points directly to an array of managed component pointers on this GameObject
+            ulong compArr = Mem.Ptr(nativeLight + 0x18, false);
+            if (compArr != 0 && compArr.IsValidVirtualAddress())
+            {
+                Span<ulong> compPtrs = stackalloc ulong[64];
+                DmaMemory.ReadBuffer<ulong>(compArr, compPtrs, false);
+                ulong foundHd = 0;
+                for (int i = 0; i < compPtrs.Length; i++)
+                {
+                    ulong comp = compPtrs[i];
+                    if (comp == 0 || !comp.IsValidVirtualAddress()) continue;
+                    string cName = ClassName(comp);
+                    if (foundHd == 0 && cName.IndexOf("HDAdditionalLightData", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        foundHd = comp;
+                    }
+                    if (lightSource == 0 && cName.Equals("Light", StringComparison.OrdinalIgnoreCase))
+                    {
+                        lightSource = comp;
+                    }
+                    if (foundHd != 0 && lightSource != 0)
+                        return foundHd;
+                }
+                if (foundHd != 0) return foundHd;
+            }
+
+            // Inspect candidate pointers on nativeLight: 0x20 (native GameObject), 0x28, 0x30, 0x58
+            ulong[] candOffsets = [0x20, 0x28, 0x30, 0x58];
+            Span<ulong> subPtrs = stackalloc ulong[32];
+            for (int o = 0; o < candOffsets.Length; o++)
+            {
+                ulong cand = Mem.Ptr(nativeLight + candOffsets[o], false);
+                if (cand == 0 || !cand.IsValidVirtualAddress()) continue;
+
+                string candName = ClassName(cand);
+                if (candName.IndexOf("HDAdditionalLightData", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return cand;
+                }
+
+                // Check if candidate points to a component array at +0x18 or +0x58
+                ulong[] subOffsets = [0x18, 0x58];
+                for (int s = 0; s < subOffsets.Length; s++)
+                {
+                    ulong subArr = Mem.Ptr(cand + subOffsets[s], false);
+                    if (subArr == 0 || !subArr.IsValidVirtualAddress()) continue;
+
+                    DmaMemory.ReadBuffer<ulong>(subArr, subPtrs, false);
+                    for (int i = 0; i < subPtrs.Length; i++)
+                    {
+                        ulong subComp = subPtrs[i];
+                        if (subComp == 0 || !subComp.IsValidVirtualAddress()) continue;
+                        string subName = ClassName(subComp);
+                        if (subName.IndexOf("HDAdditionalLightData", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            return subComp;
+                        }
+                    }
+                }
+            }
+
+            return 0;
+        }
+
+        public static bool TryResolveGunFlashlight(
+            ulong localHub,
+            ulong equippedItem,
+            out ulong viewmodel,
+            out ulong lightSource,
+            out ulong hdLightData,
+            out ulong nativeLight,
+            out string failure)
+        {
+            viewmodel = 0;
+            lightSource = 0;
+            hdLightData = 0;
+            nativeLight = 0;
+            failure = "No flashlight found";
+
+            if (localHub == 0 || !localHub.IsValidVirtualAddress())
+            {
+                failure = "Waiting for player";
+                return false;
+            }
+
+            if (equippedItem == 0 || !equippedItem.IsValidVirtualAddress())
+            {
+                failure = "No equipped weapon";
+                return false;
+            }
+
+            ulong flashlightExt = 0;
+
+            // Check if equippedItem is a standalone handheld flashlight (FlashlightItem)
+            string itemKlass = ClassName(equippedItem);
+            if (itemKlass.IndexOf("FlashlightItem", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                if (TryReadObjectField(equippedItem, "_lightSource", out lightSource) ||
+                    (lightSource = Mem.Ptr(equippedItem + 0x98, false)) != 0)
+                {
+                    if (lightSource.IsValidVirtualAddress())
+                    {
+                        nativeLight = Mem.Ptr(lightSource + 0x10, false);
+                    }
+                }
+            }
+
+            // Resolve Viewmodel
+            if (!TryReadObjectField(equippedItem, "ViewModel", out viewmodel) || viewmodel == 0 || !viewmodel.IsValidVirtualAddress())
+            {
+                viewmodel = Mem.Ptr(equippedItem + 0x30, false);
+            }
+
+            if (viewmodel != 0 && viewmodel.IsValidVirtualAddress())
+            {
+                ulong viewmodelKlass = Mem.Ptr(viewmodel, false);
+                string vmKlassName = ClassName(viewmodel);
+
+                // Standalone Flashlight Viewmodel check
+                if (vmKlassName.IndexOf("FlashlightViewmodel", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    if (lightSource == 0)
+                    {
+                        if (TryReadObjectField(viewmodel, "_light", out lightSource) ||
+                            (lightSource = Mem.Ptr(viewmodel + 0x80, false)) != 0)
+                        {
+                            if (lightSource.IsValidVirtualAddress())
+                            {
+                                nativeLight = Mem.Ptr(lightSource + 0x10, false);
+                            }
+                        }
+                    }
+                }
+
+                // Tier 1: Scan Viewmodel Attachment GameObject Groups (<Attachments>k__BackingField at 0xC0)
+                ulong attGroupsOffset = 0;
+                if (!TryGetFieldOffset(viewmodelKlass, "<Attachments>k__BackingField", out attGroupsOffset) &&
+                    !TryGetFieldOffset(viewmodelKlass, "_attachments", out attGroupsOffset))
+                {
+                    attGroupsOffset = 0xC0;
+                }
+
+                ulong attGroupsArr = Mem.Ptr(viewmodel + attGroupsOffset, false);
+                if (attGroupsArr == 0 && attGroupsOffset != 0xC0)
+                {
+                    attGroupsArr = Mem.Ptr(viewmodel + 0xC0, false);
+                }
+
+                if (attGroupsArr != 0 && attGroupsArr.IsValidVirtualAddress())
+                {
+                    int groupCount = Mem.Val<int>(attGroupsArr + Offsets.Array_max_length, false);
+                    if (groupCount > 0 && groupCount <= 64)
+                    {
+                        for (int g = 0; g < groupCount; g++)
+                        {
+                            // AttachmentGameObjectGroup struct at offset Array_items + g * 8
+                            // Field 0x0 is GameObject[] Group
+                            ulong groupArr = Mem.Ptr(attGroupsArr + Offsets.Array_items + (ulong)g * 8, false);
+                            if (groupArr == 0 || !groupArr.IsValidVirtualAddress()) continue;
+
+                            int goCount = Mem.Val<int>(groupArr + Offsets.Array_max_length, false);
+                            if (goCount <= 0 || goCount > 64) continue;
+
+                            for (int j = 0; j < goCount; j++)
+                            {
+                                ulong managedGo = Mem.Ptr(groupArr + Offsets.Array_items + (ulong)j * 8, false);
+                                if (managedGo == 0 || !managedGo.IsValidVirtualAddress()) continue;
+
+                                ulong nativeGo = Mem.Ptr(managedGo + 0x10, false);
+                                if (nativeGo == 0 || !nativeGo.IsValidVirtualAddress()) continue;
+
+                                TryScanGameObjectForLight(nativeGo, ref flashlightExt, ref lightSource, ref hdLightData, ref nativeLight);
+
+                                if (flashlightExt != 0 && hdLightData != 0 && nativeLight != 0)
+                                    break;
+                            }
+
+                            if (flashlightExt != 0 && hdLightData != 0 && nativeLight != 0)
+                                break;
+                        }
+                    }
+                }
+
+                // Tier 2: Scan Viewmodel Extensions (<Extensions>k__BackingField at 0xB8)
+                if (flashlightExt == 0 || lightSource == 0)
+                {
+                    ulong extsOffset = 0;
+                    if (!TryGetFieldOffset(viewmodelKlass, "<Extensions>k__BackingField", out extsOffset) &&
+                        !TryGetFieldOffset(viewmodelKlass, "_extensions", out extsOffset))
+                    {
+                        extsOffset = 0xB8;
+                    }
+
+                    ulong extsArr = Mem.Ptr(viewmodel + extsOffset, false);
+                    if (extsArr == 0 && extsOffset != 0xB8)
+                    {
+                        extsArr = Mem.Ptr(viewmodel + 0xB8, false);
+                    }
+
+                    if (extsArr != 0 && extsArr.IsValidVirtualAddress())
+                    {
+                        int len = Mem.Val<int>(extsArr + Offsets.Array_max_length, false);
+                        if (len > 0 && len <= 64)
+                        {
+                            for (int i = 0; i < len; i++)
+                            {
+                                ulong ext = Mem.Ptr(extsArr + Offsets.Array_items + (ulong)i * 8, false);
+                                if (ext == 0 || !ext.IsValidVirtualAddress()) continue;
+
+                                string name = ClassName(ext);
+                                if (name.IndexOf("Flashlight", StringComparison.OrdinalIgnoreCase) >= 0)
+                                {
+                                    flashlightExt = ext;
+                                    ulong ls = Mem.Ptr(ext + 0x40, false);
+                                    if (ls != 0 && ls.IsValidVirtualAddress())
+                                    {
+                                        lightSource = ls;
+                                        nativeLight = Mem.Ptr(ls + 0x10, false);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Tier 3: Scan Firearm Item Attachments (_attachments at 0x118)
+            if (flashlightExt == 0 || lightSource == 0)
+            {
+                ulong attOffset = 0x118;
+                ulong attArr = Mem.Ptr(equippedItem + attOffset, false);
+                if (attArr != 0 && attArr.IsValidVirtualAddress())
+                {
+                    int attLen = Mem.Val<int>(attArr + Offsets.Array_max_length, false);
+                    if (attLen > 0 && attLen <= 32)
+                    {
+                        for (int a = 0; a < attLen; a++)
+                        {
+                            ulong att = Mem.Ptr(attArr + Offsets.Array_items + (ulong)a * 8, false);
+                            if (att == 0 || !att.IsValidVirtualAddress()) continue;
+
+                            string attClass = ClassName(att);
+                            if (attClass.IndexOf("Flashlight", StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                ulong nativeAtt = Mem.Ptr(att + 0x10, false);
+                                if (nativeAtt.IsValidVirtualAddress())
+                                {
+                                    ulong[] goOffsets = [0x58, 0x30, 0x28, 0x18];
+                                    for (int o = 0; o < goOffsets.Length; o++)
+                                    {
+                                        ulong nativeGo = Mem.Ptr(nativeAtt + goOffsets[o], false);
+                                        if (nativeGo.IsValidVirtualAddress())
+                                        {
+                                            TryScanGameObjectForLight(nativeGo, ref flashlightExt, ref lightSource, ref hdLightData, ref nativeLight);
+                                            if (flashlightExt != 0 || lightSource != 0) break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // If we found flashlightExt but lightSource is still 0, try reading _lightSource field directly
+            if (flashlightExt != 0 && (lightSource == 0 || !lightSource.IsValidVirtualAddress()))
+            {
+                ulong ls = Mem.Ptr(flashlightExt + 0x40, false);
+                if (ls == 0 || !ls.IsValidVirtualAddress())
+                {
+                    TryReadObjectField(flashlightExt, "_lightSource", out ls);
+                }
+                if (ls != 0 && ls.IsValidVirtualAddress())
+                {
+                    lightSource = ls;
+                    nativeLight = Mem.Ptr(ls + 0x10, false);
+                }
+            }
+
+            // If we have lightSource, resolve nativeLight
+            if (lightSource != 0 && lightSource.IsValidVirtualAddress() && (nativeLight == 0 || !nativeLight.IsValidVirtualAddress()))
+            {
+                nativeLight = Mem.Ptr(lightSource + 0x10, false);
+            }
+
+            // If we have nativeLight, resolve hdLightData directly from the native component array (nativeLight + 0x18)
+            if (hdLightData == 0 && nativeLight != 0 && nativeLight.IsValidVirtualAddress())
+            {
+                hdLightData = FindHDLightDataFromNative(nativeLight, ref lightSource);
+            }
+
+            // Secondary search if hdLightData is still 0
+            if (hdLightData == 0)
+            {
+                if (nativeLight != 0 && nativeLight.IsValidVirtualAddress())
+                {
+                    ulong[] goOffsets = [0x20, 0x58, 0x30, 0x28, 0x18];
+                    for (int o = 0; o < goOffsets.Length; o++)
+                    {
+                        ulong nativeGo = Mem.Ptr(nativeLight + goOffsets[o], false);
+                        if (nativeGo.IsValidVirtualAddress())
+                        {
+                            TryScanGameObjectForLight(nativeGo, ref flashlightExt, ref lightSource, ref hdLightData, ref nativeLight);
+                            if (hdLightData != 0) break;
+                        }
+                    }
+                }
+
+                if (hdLightData == 0 && flashlightExt != 0)
+                {
+                    if (TryReadObjectField(flashlightExt, "_hdLightData", out ulong hd) ||
+                        TryReadObjectField(flashlightExt, "_additionalData", out hd))
+                    {
+                        if (hd.IsValidVirtualAddress()) hdLightData = hd;
+                    }
+                }
+            }
+
+            if (hdLightData == 0 && nativeLight == 0)
+            {
+                failure = (flashlightExt == 0) ? "Weapon has no flashlight attachment" : "Light component unresolvable";
+                return false;
+            }
+
+            return true;
+        }
+
+        public static void PollGunFlashlight(ulong localHub = 0, ulong item = 0)
+        {
+            lock (_gunFlashlightLock)
+            {
+                if (!MasterMemWritesEnabled || !GunFlashlightEnabled)
+                {
+                    _lastCheckedFlashlightItem = 0;
+                    _lastFlashlightItemHadFlashlight = false;
+                    _lastFlashlightFailure = null;
+                    _flashlightApplied = false;
+                    GunFlashlightStatus = TryRestoreGunFlashlight() ? "Off" : "Restore blocked";
+                    return;
+                }
+
+                if (localHub == 0) localHub = LocalHub();
+                if (localHub == 0)
+                {
+                    _lastCheckedFlashlightItem = 0;
+                    _lastFlashlightItemHadFlashlight = false;
+                    _lastFlashlightFailure = null;
+                    _flashlightApplied = false;
+                    if (!TryRestoreGunFlashlight())
+                    {
+                        GunFlashlightStatus = "Restore blocked";
+                        return;
+                    }
+                    GunFlashlightStatus = "Waiting for player";
+                    return;
+                }
+
+                if (item == 0)
+                {
+                    if (!TryReadObjectField(localHub, "inventory", out ulong inventory))
+                    {
+                        _lastCheckedFlashlightItem = 0;
+                        _lastFlashlightItemHadFlashlight = false;
+                        _lastFlashlightFailure = null;
+                        _flashlightApplied = false;
+                        if (!TryRestoreGunFlashlight())
+                        {
+                            GunFlashlightStatus = "Restore blocked";
+                            return;
+                        }
+                        GunFlashlightStatus = "Inventory unavailable";
+                        return;
+                    }
+                    TryReadObjectField(inventory, "_curInstance", out item);
+                }
+
+                long now = Stopwatch.GetTimestamp();
+
+                // If resolution previously failed on this item, retry every 500ms instead of permanently locking out
+                if (item == _lastCheckedFlashlightItem && !_lastFlashlightItemHadFlashlight && _activeFlashlightViewmodelObject == 0)
+                {
+                    if ((double)(now - _lastFlashlightRetryTicks) / Stopwatch.Frequency < 0.5)
+                    {
+                        GunFlashlightStatus = item == 0 ? "No equipped item" : (_lastFlashlightFailure ?? "Weapon has no flashlight attachment");
+                        return;
+                    }
+                    _lastFlashlightRetryTicks = now;
+                }
+
+                if (_flashlightApplied && item == _lastCheckedFlashlightItem && _activeFlashlightViewmodelObject != 0)
+                {
+                    if ((double)(now - _lastFlashlightVerifyTicks) / Stopwatch.Frequency < 0.1)
+                        return;
+                }
+
+                if (!TryResolveGunFlashlight(
+                    localHub,
+                    item,
+                    out ulong viewmodel,
+                    out ulong lightSource,
+                    out ulong hdLightData,
+                    out ulong nativeLight,
+                    out string failure))
+                {
+                    _lastCheckedFlashlightItem = item;
+                    _lastFlashlightItemHadFlashlight = false;
+                    _lastFlashlightFailure = failure;
+                    _flashlightApplied = false;
+                    if (!TryRestoreGunFlashlight())
+                    {
+                        GunFlashlightStatus = "Restore blocked";
+                        return;
+                    }
+                    GunFlashlightStatus = failure;
+                    return;
+                }
+
+                _lastCheckedFlashlightItem = item;
+                _lastFlashlightItemHadFlashlight = true;
+                _lastFlashlightFailure = null;
+
+                if (_activeFlashlightViewmodelObject != viewmodel ||
+                    _activeFlashlightLightSource != lightSource ||
+                    _activeFlashlightHdLightData != hdLightData ||
+                    _activeFlashlightNativeLight != nativeLight)
+                {
+                    if (!TryRestoreGunFlashlight())
+                    {
+                        GunFlashlightStatus = "Restore blocked";
+                        return;
+                    }
+
+                    _activeFlashlightViewmodelObject = viewmodel;
+                    _activeFlashlightLightSource = lightSource;
+                    _activeFlashlightHdLightData = hdLightData;
+                    _activeFlashlightNativeLight = nativeLight;
+
+                    if (hdLightData != 0)
+                    {
+                        ulong hdKlass = Mem.Ptr(hdLightData, false);
+                        ulong dimmerOffset = 0x48;
+                        if (TryGetFieldOffset(hdKlass, "m_LightDimmer", out ulong dOff) ||
+                            TryGetFieldOffset(hdKlass, "lightDimmer", out dOff))
+                            dimmerOffset = dOff;
+
+                        ulong fadeDistOffset = 0x50;
+                        if (TryGetFieldOffset(hdKlass, "m_FadeDistance", out ulong fOff) ||
+                            TryGetFieldOffset(hdKlass, "fadeDistance", out fOff))
+                            fadeDistOffset = fOff;
+
+                        ulong intensityOffset = 0x38;
+                        if (TryGetFieldOffset(hdKlass, "m_Intensity", out ulong iOff) ||
+                            TryGetFieldOffset(hdKlass, "intensity", out iOff) ||
+                            TryGetFieldOffset(hdKlass, "displayLightIntensity", out iOff))
+                            intensityOffset = iOff;
+
+                        ulong innerSpotOffset = 0x40;
+                        if (TryGetFieldOffset(hdKlass, "m_InnerSpotPercent", out ulong inOff) ||
+                            TryGetFieldOffset(hdKlass, "innerSpotPercent", out inOff))
+                            innerSpotOffset = inOff;
+
+                        ulong volDimmerOffset = 0x4C;
+                        if (TryGetFieldOffset(hdKlass, "m_VolumetricDimmer", out ulong vOff) ||
+                            TryGetFieldOffset(hdKlass, "volumetricDimmer", out vOff))
+                            volDimmerOffset = vOff;
+
+                        ulong volFadeOffset = 0x54;
+                        if (TryGetFieldOffset(hdKlass, "m_VolumetricFadeDistance", out ulong vfOff) ||
+                            TryGetFieldOffset(hdKlass, "volumetricFadeDistance", out vfOff))
+                            volFadeOffset = vfOff;
+
+                        _addrLightDimmer = hdLightData + dimmerOffset;
+                        _addrFadeDistance = hdLightData + fadeDistOffset;
+                        _addrIntensity = hdLightData + intensityOffset;
+                        _addrInnerSpotPercent = hdLightData + innerSpotOffset;
+                        _addrVolumetricDimmer = hdLightData + volDimmerOffset;
+                        _addrVolumetricFadeDistance = hdLightData + volFadeOffset;
+
+                        _origLightDimmer = Mem.Val<float>(_addrLightDimmer, false);
+                        _origFadeDistance = Mem.Val<float>(_addrFadeDistance, false);
+                        _origIntensity = Mem.Val<float>(_addrIntensity, false);
+                        _origInnerSpotPercent = Mem.Val<float>(_addrInnerSpotPercent, false);
+                        _origVolumetricDimmer = Mem.Val<float>(_addrVolumetricDimmer, false);
+                        _origVolumetricFadeDistance = Mem.Val<float>(_addrVolumetricFadeDistance, false);
+
+                        if (_origLightDimmer <= 0.001f || _origLightDimmer > 32.0f) _origLightDimmer = 1.0f;
+                        if (_origFadeDistance <= 1.0f || _origFadeDistance > 100000.0f) _origFadeDistance = 10000.0f;
+                        if (_origIntensity <= 0.001f || _origIntensity > 100000.0f) _origIntensity = 50.0f;
+                        if (_origVolumetricDimmer <= 0.001f || _origVolumetricDimmer > 32.0f) _origVolumetricDimmer = 1.0f;
+                        if (_origVolumetricFadeDistance <= 1.0f || _origVolumetricFadeDistance > 100000.0f) _origVolumetricFadeDistance = 10000.0f;
+                    }
+
+                    if (nativeLight != 0)
+                    {
+                        ulong lightData = Mem.Ptr(nativeLight + 0x40, false);
+                        if (lightData == 0 || !lightData.IsValidVirtualAddress())
+                            lightData = nativeLight + 0x90;
+
+                        _addrNativeIntensity = lightData + 0x38;
+                        _addrNativeRange = lightData + 0x3C;
+                        _addrNativeSpotAngle = lightData + 0x48;
+                        _addrNativeInnerSpotAngle = lightData + 0x4C;
+
+                        _origNativeIntensity = Mem.Val<float>(_addrNativeIntensity, false);
+                        _origNativeRange = Mem.Val<float>(_addrNativeRange, false);
+                        _origNativeSpotAngle = Mem.Val<float>(_addrNativeSpotAngle, false);
+                        _origNativeInnerSpotAngle = Mem.Val<float>(_addrNativeInnerSpotAngle, false);
+
+                        if (_origNativeIntensity <= 0.01f || _origNativeIntensity > 500.0f) _origNativeIntensity = 27.211f;
+                        if (_origNativeRange <= 1.0f || _origNativeRange > 500.0f) _origNativeRange = 60.0f;
+                        if (_origNativeSpotAngle <= 5.0f || _origNativeSpotAngle > 175.0f) _origNativeSpotAngle = 80.0f;
+                        if (_origNativeInnerSpotAngle < 0.1f || _origNativeInnerSpotAngle > 175.0f) _origNativeInnerSpotAngle = 8.0f;
+                    }
+
+                    _activeFlashlightOriginalCaptured = true;
+                }
+
+                _lastFlashlightVerifyTicks = now;
+
+                if (_addrLightDimmer != 0)
+                {
+                    float targetDimmer = Math.Clamp(_origLightDimmer * GunFlashlightIntensityMult, 0.1f, 32.0f);
+                    Mem.TryWriteValue<float>(_addrLightDimmer, targetDimmer);
+                }
+                if (_addrIntensity != 0 && _origIntensity > 0f)
+                {
+                    float targetIntensity = _origIntensity * GunFlashlightIntensityMult;
+                    Mem.TryWriteValue<float>(_addrIntensity, targetIntensity);
+                }
+                if (_addrFadeDistance != 0)
+                {
+                    float targetFade = Math.Max(_origFadeDistance, GunFlashlightRange * 2f);
+                    Mem.TryWriteValue<float>(_addrFadeDistance, targetFade);
+                }
+                if (_addrInnerSpotPercent != 0)
+                {
+                    float targetInner = Math.Clamp((GunFlashlightSpotAngle / 120.0f) * 100.0f, 0f, 95f);
+                    Mem.TryWriteValue<float>(_addrInnerSpotPercent, targetInner);
+                }
+                if (_addrVolumetricDimmer != 0)
+                {
+                    float targetVol = Math.Clamp(_origVolumetricDimmer * GunFlashlightIntensityMult, 0.1f, 32.0f);
+                    Mem.TryWriteValue<float>(_addrVolumetricDimmer, targetVol);
+                }
+                if (_addrVolumetricFadeDistance != 0)
+                {
+                    float targetVolFade = Math.Max(_origVolumetricFadeDistance, GunFlashlightRange * 2f);
+                    Mem.TryWriteValue<float>(_addrVolumetricFadeDistance, targetVolFade);
+                }
+                if (_addrNativeIntensity != 0 && _origNativeIntensity > 0f)
+                {
+                    Mem.TryWriteValue<float>(_addrNativeIntensity, _origNativeIntensity * GunFlashlightIntensityMult);
+                }
+                if (_addrNativeRange != 0)
+                {
+                    Mem.TryWriteValue<float>(_addrNativeRange, GunFlashlightRange);
+                }
+                if (_addrNativeSpotAngle != 0)
+                {
+                    Mem.TryWriteValue<float>(_addrNativeSpotAngle, GunFlashlightSpotAngle);
+                }
+                if (_addrNativeInnerSpotAngle != 0)
+                {
+                    float targetInnerAngle = Math.Clamp(GunFlashlightSpotAngle * 0.15f, 1.0f, Math.Max(1.0f, GunFlashlightSpotAngle - 1.0f));
+                    Mem.TryWriteValue<float>(_addrNativeInnerSpotAngle, targetInnerAngle);
+                }
+
+                _flashlightApplied = true;
+                GunFlashlightStatus = $"Active ({GunFlashlightSpotAngle:0}°, {GunFlashlightIntensityMult:0.0}x, {GunFlashlightRange:0}m)";
+            }
+        }
+
 
         // ═══════════════════════════════════════════════════════════
         //  BRIGHTNESS / FULLBRIGHT (LiftGammaGain, Exposure, ColorAdjustments)
@@ -6873,6 +7747,7 @@ namespace ScpslApp
             private static PanelWarheadInfo _latestWarhead;
             private static volatile bool _latestRoundStarted;
             private static volatile int _latestRoundTime;
+            private static readonly Stopwatch _localRoundStopwatch = new();
             private static volatile AliveSpectatableInfo _latestAliveInfo = new();
             private static volatile HashSet<ulong> _latestDeadHubs = new();
             private static bool _dmaRunning;
@@ -6900,6 +7775,8 @@ namespace ScpslApp
 
             public static bool LatestRoundStarted => _latestRoundStarted;
             public static int LatestRoundTime => _latestRoundTime;
+            public static IReadOnlyList<PlayerInfo> CurrentPlayers => _currentSnapshot.Players;
+            public static Stopwatch LocalRoundStopwatch => _localRoundStopwatch;
 
             private int _overlayWidth;
             private int _overlayHeight;
@@ -7118,10 +7995,10 @@ namespace ScpslApp
 
                     ulong localHub = 0;
                     ulong equippedItem = 0;
-                    if (GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.NoFlashEnabled)
+                    if (GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.NoFlashEnabled || GameReader.GunFlashlightEnabled || GameReader.HasPendingRestores)
                     {
                         localHub = GameReader.LocalHub();
-                        if (localHub != 0 && (GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled) && GameReader.TryReadObjectField(localHub, "inventory", out ulong inv))
+                        if (localHub != 0 && (GameReader.NoSwayEnabled || GameReader.NoRecoilEnabled || GameReader.GunFlashlightEnabled || GameReader.HasPendingRestores) && GameReader.TryReadObjectField(localHub, "inventory", out ulong inv))
                         {
                             GameReader.TryReadObjectField(inv, "_curInstance", out equippedItem);
                         }
@@ -7131,6 +8008,7 @@ namespace ScpslApp
                     GameReader.PollViewmodelFov();
                     GameReader.PollNoSway(localHub, equippedItem);
                     GameReader.PollNoRecoil(localHub, equippedItem);
+                    GameReader.PollGunFlashlight(localHub, equippedItem);
                     GameReader.PollBunnyhop();
                     GameReader.PollViewangleAim(cam, currentPlayers);
                     GameReader.PollNoFlash(localHub);
@@ -7193,9 +8071,11 @@ namespace ScpslApp
 
                     // Poll warhead and round progress at 20Hz (~50ms)
                     _latestWarhead = GameReader.ReadPanelWarheadTime();
-                    bool roundStartedRaw = GameReader.IsRoundStarted(currentPlayers);
+                    bool localAlive = GameReader.IsLocalPlayerAlive();
+                    bool hasLivingPlayers = localAlive || GameReader.HasLivingPlayers(currentPlayers);
+                    bool roundStartedRaw = hasLivingPlayers || GameReader.IsRoundStarted(currentPlayers);
                     _latestRoundTime = GameReader.ReadRoundTime();
-                    bool isEnded = GameReader.IsRoundEnded();
+                    bool isEnded = !hasLivingPlayers && GameReader.IsRoundEnded(currentPlayers);
 
                     // Throttle spectatable alive hubs and dead ragdolls to 2 Hz (500ms) to save PCIe scatter traffic
                     long now = Stopwatch.GetTimestamp();
@@ -7210,20 +8090,7 @@ namespace ScpslApp
                     if (_latestRoundStarted)
                     {
                         // Currently IN ROUND. Check if the round has ended.
-                        bool appearsEnded = isEnded || (!roundStartedRaw && _latestRoundTime == 0);
-
-                        // If any players in current snapshot are confirmed alive, the round CANNOT have ended
-                        if (appearsEnded && currentPlayers != null && currentPlayers.Count > 0)
-                        {
-                            for (int i = 0; i < currentPlayers.Count; i++)
-                            {
-                                if (RoleIsAlive(currentPlayers[i].Role))
-                                {
-                                    appearsEnded = false;
-                                    break;
-                                }
-                            }
-                        }
+                        bool appearsEnded = !hasLivingPlayers && (isEnded || (!roundStartedRaw && _latestRoundTime == 0));
 
                         if (appearsEnded)
                         {
@@ -7234,6 +8101,7 @@ namespace ScpslApp
                             if (_roundEndConsecutiveTicks >= requiredTicks)
                             {
                                 _latestRoundStarted = false;
+                                _localRoundStopwatch.Reset();
                                 _roundEndConsecutiveTicks = 0;
                                 _roundStartConsecutiveTicks = 0;
                                 MemDMABase.OnRoundEnded();
@@ -7253,13 +8121,14 @@ namespace ScpslApp
                     else
                     {
                         // Currently NOT IN ROUND (Waiting for players / Lobby). Check if round has started.
-                        if (roundStartedRaw && !isEnded)
+                        if (hasLivingPlayers || (roundStartedRaw && !isEnded))
                         {
                             _roundStartConsecutiveTicks++;
                             // Fast startup: 2 consecutive positive ticks (100ms) to filter out single-tick memory noise
                             if (_roundStartConsecutiveTicks >= 2)
                             {
                                 _latestRoundStarted = true;
+                                _localRoundStopwatch.Restart();
                                 _roundStartConsecutiveTicks = 0;
                                 _roundEndConsecutiveTicks = 0;
                                 MemDMABase.OnRoundStarted();
@@ -7980,7 +8849,11 @@ namespace ScpslApp
                         LessFogClearness = GameReader.LessFogClearness,
                         LessFogScp244Enabled = GameReader.LessFogScp244Enabled,
                         BrightnessEnabled = GameReader.BrightnessEnabled,
-                        BrightnessEv = GameReader.BrightnessEv
+                        BrightnessEv = GameReader.BrightnessEv,
+                        GunFlashlightEnabled = GameReader.GunFlashlightEnabled,
+                        GunFlashlightSpotAngle = GameReader.GunFlashlightSpotAngle,
+                        GunFlashlightIntensityMult = GameReader.GunFlashlightIntensityMult,
+                        GunFlashlightRange = GameReader.GunFlashlightRange
                     };
 
                     string json = JsonSerializer.Serialize(cfg, new JsonSerializerOptions { WriteIndented = true });
@@ -8106,6 +8979,10 @@ namespace ScpslApp
                     GameReader.LessFogScp244Enabled = cfg.LessFogScp244Enabled;
                     GameReader.BrightnessEnabled = cfg.BrightnessEnabled;
                     GameReader.BrightnessEv = cfg.BrightnessEv;
+                    GameReader.GunFlashlightEnabled = cfg.GunFlashlightEnabled;
+                    GameReader.GunFlashlightSpotAngle = cfg.GunFlashlightSpotAngle;
+                    GameReader.GunFlashlightIntensityMult = cfg.GunFlashlightIntensityMult;
+                    GameReader.GunFlashlightRange = cfg.GunFlashlightRange;
 
                     _lastConfigStatus = "Config loaded!";
                     _configStatusTime = DateTime.UtcNow;
@@ -8880,8 +9757,37 @@ namespace ScpslApp
                                       ModernSlider("##BrightnessEv", "Exposure & Luminance Boost", ref GameReader.BrightnessEv, 0.0f, 4.0f, "+{0:0.0} EV");
                                   }
                                   ImGui.Spacing();
-                                  ImGui.TextColored(new Vector4(0.55f, 0.55f, 0.65f, 1.00f), $"Status: {GameReader.BrightnessStatus}");
-                                }
+                                   ImGui.Spacing();
+                                   ImGui.TextColored(new Vector4(0.55f, 0.55f, 0.65f, 1.00f), $"Status: {GameReader.BrightnessStatus}");
+
+                                   ImGui.Spacing();
+                                   ImGui.Separator();
+                                   ImGui.Spacing();
+
+                                   // 4. Gun Flashlight Enhancement
+                                   ToggleSwitch("##GunFlashlight", ref GameReader.GunFlashlightEnabled, "Gun Flashlight Enhancement");
+                                   if (ImGui.IsItemHovered())
+                                   {
+                                       ImGui.SetTooltip("Enhances beam angle, brightness, and throw distance exclusively on your weapon's flashlight");
+                                   }
+                                   if (GameReader.GunFlashlightEnabled)
+                                   {
+                                       ImGui.Spacing();
+                                        ImGui.Spacing();
+                                        ModernSlider("##FlashlightAngle", "Beam Angle", ref GameReader.GunFlashlightSpotAngle, 10.0f, 150.0f, "{0:0}°");
+                                        ImGui.Spacing();
+                                        ModernSlider("##FlashlightIntensity", "Brightness Multiplier", ref GameReader.GunFlashlightIntensityMult, 1.0f, 10.0f, "{0:0.0}x");
+                                        ImGui.Spacing();
+                                        ModernSlider("##FlashlightRange", "Throw Distance", ref GameReader.GunFlashlightRange, 10.0f, 300.0f, "{0:0}m");
+                                    }
+                                    ImGui.Spacing();
+                                    var statusCol = GameReader.GunFlashlightStatus.StartsWith("Active", StringComparison.OrdinalIgnoreCase)
+                                        ? new Vector4(0.30f, 0.90f, 0.40f, 1.00f)
+                                        : (GameReader.GunFlashlightStatus.Equals("Off", StringComparison.OrdinalIgnoreCase)
+                                            ? new Vector4(0.55f, 0.55f, 0.65f, 1.00f)
+                                            : new Vector4(1.00f, 0.75f, 0.30f, 1.00f));
+                                    ImGui.TextColored(statusCol, $"Status: {GameReader.GunFlashlightStatus}");
+                                 }
                             }
                             ImGui.EndChild();
                         }
@@ -9187,7 +10093,7 @@ namespace ScpslApp
                         }
                         uint genCol = engagedGens == 3 ? ColGreen : (engagedGens > 0 ? PackColor(1.0f, 0.85f, 0.2f, 1.0f) : ColGray);
 
-                        int rTime = _latestRoundTime;
+                        int rTime = _latestRoundTime > 0 ? _latestRoundTime : (int)_localRoundStopwatch.Elapsed.TotalSeconds;
                         string roundStr = roundStarted
                             ? $"Round: {rTime / 60:D2}:{rTime % 60:D2}"
                             : "Waiting for Players";
@@ -9768,13 +10674,170 @@ namespace ScpslApp
             ulong rsSingleton = Mem.Ptr(rsSf + Offsets.RoundSummary_singleton);
             byte rsEnded = (rsSingleton != 0) ? Mem.Val<byte>(rsSingleton + Offsets.RoundSummary_isRoundEnded) : (byte)0;
             Console.WriteLine($"RoundSummary: sf=0x{rsSf:X}, roundTime={rTime}, singletonSet={rsSet}, singleton=0x{rsSingleton:X}, isRoundEnded={rsEnded}");
-            Console.WriteLine($"IsRoundStarted(raw) = {GameReader.IsRoundStarted()}, IsRoundEnded() = {GameReader.IsRoundEnded()}");
+            Console.WriteLine($"RoundStartTimer: running={GameReader.IsRoundStartTimerRunning()}, readRoundTime={GameReader.ReadRoundTime()}");
+            Console.WriteLine($"Living Check: localAlive={GameReader.IsLocalPlayerAlive()}, hasLiving={GameReader.HasLivingPlayers(GameReader.ScpslOverlay.CurrentPlayers)}");
+            Console.WriteLine($"IsRoundStarted(raw) = {GameReader.IsRoundStarted(GameReader.ScpslOverlay.CurrentPlayers)}, IsRoundEnded() = {GameReader.IsRoundEnded(GameReader.ScpslOverlay.CurrentPlayers)}, LatestRoundStarted = {GameReader.ScpslOverlay.LatestRoundStarted}");
 
             // UnityInput Diagnostic
             Console.WriteLine("\n--- UNITY INPUT DIAGNOSTIC ---");
             ulong imPtr = DmaMemory.ReadPtr(DmaMemory.UnityBase + UnityOffsets.ModuleBase.InputManager, false);
             Console.WriteLine($"Hardcoded InputManager (+0x{UnityOffsets.ModuleBase.InputManager:X}): 0x{imPtr:X}");
             Console.WriteLine($"UnityInput.IsConnected: {UnityInput.IsConnected}, Status: '{UnityInput.Status}', Addr: 0x{UnityInput.InputManagerAddress:X}");
+
+            // Weapon & Flashlight Diagnostic
+            Console.WriteLine("\n--- WEAPON & FLASHLIGHT DIAGNOSTIC ---");
+            ulong rhLocal = GameReader.LocalHub();
+            Console.WriteLine($"LocalHub: 0x{rhLocal:X}");
+            if (rhLocal != 0)
+            {
+                if (GameReader.TryReadObjectField(rhLocal, "inventory", out ulong invDiag))
+                {
+                    GameReader.TryReadObjectField(invDiag, "_curInstance", out ulong curItem);
+                    string itemKlass = GameReader.ClassName(curItem);
+                    Console.WriteLine($"Inventory: 0x{invDiag:X}, CurInstance: 0x{curItem:X} ({itemKlass})");
+
+                    ulong userInv = Mem.Ptr(invDiag + Offsets.Inventory_UserInventory);
+                    if (userInv != 0 && userInv.IsValidVirtualAddress())
+                    {
+                        ulong itemsDict = Mem.Ptr(userInv + Offsets.InventoryInfo_Items);
+                        if (itemsDict != 0 && itemsDict.IsValidVirtualAddress())
+                        {
+                            int count = Mem.Val<int>(itemsDict + Offsets.Dictionary_count);
+                            ulong entriesArr = Mem.Ptr(itemsDict + Offsets.Dictionary_entries);
+                            Console.WriteLine($"Inventory Items Count: {count}");
+                            if (count > 0 && count <= 32 && entriesArr != 0 && entriesArr.IsValidVirtualAddress())
+                            {
+                                int bytesNeeded = count * 24;
+                                Span<byte> buf = stackalloc byte[bytesNeeded];
+                                DmaMemory.ReadBuffer<byte>(entriesArr + Offsets.Array_items, buf, false);
+                                for (int i = 0; i < count; i++)
+                                {
+                                    int offset = i * 24;
+                                    int hashCode = MemoryMarshal.Read<int>(buf.Slice(offset, 4));
+                                    if (hashCode < 0) continue;
+                                    ulong itemPtr = MemoryMarshal.Read<ulong>(buf.Slice(offset + 16, 8));
+                                    if (itemPtr == 0 || !itemPtr.IsValidVirtualAddress()) continue;
+                                    int itemTypeId = Mem.Val<int>(itemPtr + Offsets.ItemBase_ItemTypeId, false);
+                                    Console.WriteLine($"  Item[{i}]: 0x{itemPtr:X} ({(ItemType)itemTypeId}, Class={GameReader.ClassName(itemPtr)})");
+                                    if (curItem == 0 || GameReader.ClassName(curItem).IndexOf("Firearm", StringComparison.OrdinalIgnoreCase) < 0)
+                                    {
+                                        if (GameReader.ClassName(itemPtr).IndexOf("Firearm", StringComparison.OrdinalIgnoreCase) >= 0)
+                                        {
+                                            curItem = itemPtr;
+                                            Console.WriteLine($"  -> Testing Flashlight on inventory firearm: 0x{curItem:X}");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    bool res = GameReader.TryResolveGunFlashlight(
+                        rhLocal,
+                        curItem,
+                        out ulong vm,
+                        out ulong ls,
+                        out ulong hd,
+                        out ulong nl,
+                        out string fail);
+                    Console.WriteLine($"TryResolveGunFlashlight: result={res}, fail='{fail}'");
+                    Console.WriteLine($"  Viewmodel:   0x{vm:X} ({GameReader.ClassName(vm)})");
+                    Console.WriteLine($"  LightSource: 0x{ls:X} ({GameReader.ClassName(ls)})");
+                    Console.WriteLine($"  HDLightData: 0x{hd:X} ({GameReader.ClassName(hd)})");
+                    Console.WriteLine($"  NativeLight: 0x{nl:X}");
+
+                    if (ls != 0)
+                    {
+                        byte[] lsRaw = new byte[0x60];
+                        DmaMemory.ReadBuffer<byte>(ls, lsRaw.AsSpan(), false);
+                        Console.WriteLine("    Managed Light fields (8-byte ptrs):");
+                        for (int o = 0; o < lsRaw.Length; o += 8)
+                        {
+                            ulong val = BitConverter.ToUInt64(lsRaw, o);
+                            Console.WriteLine($"      +0x{o:X2}: 0x{val:X} ({GameReader.ClassName(val)})");
+                        }
+                    }
+
+                    if (nl != 0)
+                    {
+                        byte[] nlRaw = new byte[0x100];
+                        DmaMemory.ReadBuffer<byte>(nl, nlRaw.AsSpan(), false);
+                        Console.WriteLine("    Native Light fields (4-byte floats & 8-byte ptrs):");
+                        for (int o = 0; o < nlRaw.Length; o += 8)
+                        {
+                            ulong ptrVal = BitConverter.ToUInt64(nlRaw, o);
+                            float f1 = BitConverter.ToSingle(nlRaw, o);
+                            float f2 = BitConverter.ToSingle(nlRaw, o + 4);
+                            string cls = ptrVal.IsValidVirtualAddress() ? GameReader.ClassName(ptrVal) : "";
+                            Console.WriteLine($"      +0x{o:X2}: 0x{ptrVal:X} ({cls}) | f0={f1:0.###} f4={f2:0.###}");
+                        }
+
+                        // Inspect candidate native GameObjects: 0x18, 0x20, 0x28, 0x30
+                        ulong[] candGo = [
+                            BitConverter.ToUInt64(nlRaw, 0x18),
+                            BitConverter.ToUInt64(nlRaw, 0x20),
+                            BitConverter.ToUInt64(nlRaw, 0x28),
+                            BitConverter.ToUInt64(nlRaw, 0x30)
+                        ];
+                        for (int cg = 0; cg < candGo.Length; cg++)
+                        {
+                            try
+                            {
+                                ulong cand = candGo[cg];
+                                if (!cand.IsValidVirtualAddress()) continue;
+                                Console.WriteLine($"    Inspecting candidate pointer [{cg}] = 0x{cand:X}:");
+                                byte[] cBuf = new byte[0x100];
+                                DmaMemory.ReadBuffer<byte>(cand, cBuf.AsSpan(), false);
+                                for (int co = 0; co < cBuf.Length; co += 8)
+                                {
+                                    ulong cVal = BitConverter.ToUInt64(cBuf, co);
+                                    string cCls = cVal.IsValidVirtualAddress() ? GameReader.ClassName(cVal) : "";
+                                    string strAscii = "";
+                                    if (cVal.IsValidVirtualAddress())
+                                    {
+                                        try {
+                                            byte[] sbuf = new byte[32];
+                                            DmaMemory.ReadBuffer<byte>(cVal, sbuf.AsSpan(), false);
+                                            int slen = 0;
+                                            while (slen < sbuf.Length && sbuf[slen] >= 32 && sbuf[slen] <= 126) slen++;
+                                            if (slen >= 3) strAscii = $" \"{Encoding.ASCII.GetString(sbuf, 0, slen)}\"";
+                                        } catch { }
+                                    }
+                                    Console.WriteLine($"      +0x{co:X2}: 0x{cVal:X} ({cCls}){strAscii}");
+
+                                    if (cCls.IndexOf("HDAdditionalLightData", StringComparison.OrdinalIgnoreCase) >= 0)
+                                    {
+                                        Console.WriteLine($"      ---> FOUND HDAdditionalLightData at 0x{cVal:X}!");
+                                        byte[] hdRaw = new byte[0x70];
+                                        DmaMemory.ReadBuffer<byte>(cVal, hdRaw.AsSpan(), false);
+
+                                         float hdDimmer = BitConverter.ToSingle(hdRaw, 0x48);
+                                         float hdIntensity = BitConverter.ToSingle(hdRaw, 0x38);
+                                         float hdVolDimmer = BitConverter.ToSingle(hdRaw, 0x4C);
+                                         float hdFadeDist = BitConverter.ToSingle(hdRaw, 0x50);
+                                         float hdVolFadeDist = BitConverter.ToSingle(hdRaw, 0x54);
+                                         Console.WriteLine($"      HD values: Dimmer={hdDimmer}, Intensity={hdIntensity}, VolDimmer={hdVolDimmer}, FadeDist={hdFadeDist}, VolFadeDist={hdVolFadeDist}");
+                                     }
+                                 }
+                             }
+                             catch { }
+                         }
+
+                         ulong lightData = Mem.Ptr(nl + 0x40, false);
+                        if (lightData == 0 || !lightData.IsValidVirtualAddress())
+                            lightData = nl + 0x90;
+
+                        float intensity = Mem.Val<float>(lightData + 0x38, false);
+                        float range = Mem.Val<float>(lightData + 0x3C, false);
+                        float spot = Mem.Val<float>(lightData + 0x48, false);
+                        float innerSpot = Mem.Val<float>(lightData + 0x4C, false);
+                        Console.WriteLine($"    Native Light values: intensity={intensity}, range={range}, spotAngle={spot}, innerSpotAngle={innerSpot}");
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("Failed to read inventory field from LocalHub.");
+                }
+            }
 
             // 1. Check Rooms
             Console.WriteLine("\n--- ROOMS ---");
@@ -9920,12 +10983,35 @@ namespace ScpslApp
             }
         }
 
+        private sealed class DiagDualWriter : TextWriter
+        {
+            private readonly TextWriter _w1;
+            private readonly TextWriter _w2;
+            public DiagDualWriter(TextWriter w1, TextWriter w2) { _w1 = w1; _w2 = w2; }
+            public override Encoding Encoding => Encoding.UTF8;
+            public override void Write(char value) { _w1.Write(value); _w2.Write(value); }
+            public override void Write(string? value) { _w1.Write(value); _w2.Write(value); }
+            public override void WriteLine(string? value) { _w1.WriteLine(value); _w2.WriteLine(value); }
+            public override void Flush() { _w1.Flush(); _w2.Flush(); }
+        }
+
         public static void Main(string[] args)
         {
             if (args.Length > 0 && args[0] == "--diag")
             {
+                Log.AllocateConsoleWindow();
+                using var fs = new FileStream(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "diag.txt"), FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
+                using var sw = new StreamWriter(fs, Encoding.UTF8) { AutoFlush = true };
+                var dual = new DiagDualWriter(Console.Out, sw);
+                Console.SetOut(dual);
+                Console.SetError(dual);
+
+                Console.WriteLine("[DIAG] Starting SCPSLDMA in diagnostic mode...");
                 var config = new ScpslConfig();
                 SharedProgram.Initialize(new DirectoryInfo(AppDomain.CurrentDomain.BaseDirectory), config);
+                ScpslOverlay.LoadConfig();
+                GameReader.MasterMemWritesEnabled = true;
+                GameReader.GunFlashlightEnabled = true;
                 var dma = new ScpslMemory("SCPSL.exe");
                 int attempts = 0;
                 while (!dma.Ready && attempts < 300)
@@ -9935,7 +11021,7 @@ namespace ScpslApp
                 }
                 if (!dma.Ready)
                 {
-                    Console.WriteLine("DMA failed to attach after 30s!");
+                    Console.WriteLine("[DIAG] DMA failed to attach after 30s!");
                     return;
                 }
                 RunDiagnostic();
@@ -9953,6 +11039,7 @@ namespace ScpslApp
                 GameReader.RestoreNoFlash();
                 GameReader.RestoreNoSmoke();
                 GameReader.RestoreBrightness();
+                GameReader.RestoreGunFlashlight();
                 Log.WriteLine($"[FATAL CRASH] Unhandled Exception: {e.ExceptionObject}");
             };
 
@@ -9967,6 +11054,7 @@ namespace ScpslApp
                 GameReader.RestoreNoFlash();
                 GameReader.RestoreNoSmoke();
                 GameReader.RestoreBrightness();
+                GameReader.RestoreGunFlashlight();
             };
 
             try
@@ -10024,6 +11112,7 @@ namespace ScpslApp
                 GameReader.RestoreNoFlash();
                 GameReader.RestoreNoSmoke();
                 GameReader.RestoreBrightness();
+                GameReader.RestoreGunFlashlight();
             }
             catch (Exception ex)
             {
@@ -10037,6 +11126,7 @@ namespace ScpslApp
                 GameReader.RestoreNoFlash();
                 GameReader.RestoreNoSmoke();
                 GameReader.RestoreBrightness();
+                GameReader.RestoreGunFlashlight();
                 Log.WriteLine($"[ERROR] Application encountered an error: {ex.Message}");
                 Log.WriteLine(ex.ToString());
                 Console.WriteLine("Press ENTER to exit...");
