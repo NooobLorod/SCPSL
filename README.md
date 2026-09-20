@@ -1,6 +1,6 @@
 # SCPSL DMA
 
-Latest additons - added flashlight mods (mem writes)
+Latest additons - third person (shitty as it doesnt spawn ur model) + instant ads
 
 ---
 
