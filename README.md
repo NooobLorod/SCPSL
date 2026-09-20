@@ -5,7 +5,7 @@
 
 # SCPSL DMA
 
-Latest additons - third person (shitty as it doesnt spawn ur model) + instant ads
+Latest additons - freecam (pretty good)
 
 ---
 
@@ -53,6 +53,9 @@ Latest additons - third person (shitty as it doesnt spawn ur model) + instant ad
 - **Interactive Repositioning** — Press `F7` to unlock and drag the HUD anywhere on screen
 
 ### ⚙️ Memory Writes
+
+- **FREECAM**
+
 - **World Camera FOV** — Custom player camera FOV (60°–120°) via native Unity 6 camera memory writes with zero-flicker redirection
 - **Hold-to-Zoom** — Dedicated zoom FOV (15°–60°) while holding a configurable keybind (default `Mouse1` / Right Click) with an interactive keybind picker
 - **Viewmodel FOV** — Custom viewmodel FOV (30°–140°) with dynamic attachment compensation and auto-restoration
