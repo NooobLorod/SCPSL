@@ -8425,6 +8425,12 @@ namespace ScpslApp
 
             protected override Task PostInitialized()
             {
+                unsafe
+                {
+                    ImGui.GetIO().NativePtr->IniFilename = null;
+                }
+                CleanStaleImguiIni();
+
                 VSync = true;
                 Position = new System.Drawing.Point(0, 0);
                 Size = new System.Drawing.Size(_overlayWidth, _overlayHeight);
@@ -9113,7 +9119,8 @@ namespace ScpslApp
             // Settings UI State Variables
             private bool _showWatermark = false;
             private bool _autoSave = true;
-            public static bool AutoSaveEnabled => _instance?._autoSave ?? true;
+            private static bool _suppressAutoSave = false;
+            public static bool AutoSaveEnabled => (_instance?._autoSave ?? true) && !_suppressAutoSave;
             private bool _debugInput = false;
             private readonly List<string> _recentInputEvents = new();
             private readonly HashSet<UnityKeyCode> _previouslyHeldKeys = new();
@@ -9590,6 +9597,128 @@ namespace ScpslApp
                     _configStatusTime = DateTime.UtcNow;
                     Log.WriteLine($"[Config] Load failed: {ex.Message}");
                 }
+            }
+
+            public static void CleanStaleImguiIni()
+            {
+                try
+                {
+                    string p1 = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "imgui.ini");
+                    if (File.Exists(p1)) File.Delete(p1);
+                }
+                catch { }
+
+                try
+                {
+                    string p2 = Path.Combine(Directory.GetCurrentDirectory(), "imgui.ini");
+                    if (File.Exists(p2)) File.Delete(p2);
+                }
+                catch { }
+            }
+
+            public static void RestartApplication(bool deleteConfig = false, bool deleteMmap = false)
+            {
+                try
+                {
+                    if (deleteConfig)
+                    {
+                        _suppressAutoSave = true;
+                        if (_instance != null) _instance._autoSave = false;
+
+                        try
+                        {
+                            string cfgBase = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
+                            if (File.Exists(cfgBase)) File.Delete(cfgBase);
+                        }
+                        catch { }
+                        try
+                        {
+                            string cfgCwd = Path.Combine(Directory.GetCurrentDirectory(), "config.json");
+                            if (File.Exists(cfgCwd)) File.Delete(cfgCwd);
+                        }
+                        catch { }
+                    }
+
+                    if (deleteMmap)
+                    {
+                        try
+                        {
+                            string mmapBase = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "mmap.txt");
+                            if (File.Exists(mmapBase)) File.Delete(mmapBase);
+                        }
+                        catch { }
+                        try
+                        {
+                            string mmapCwd = Path.Combine(Directory.GetCurrentDirectory(), "mmap.txt");
+                            if (File.Exists(mmapCwd)) File.Delete(mmapCwd);
+                        }
+                        catch { }
+                    }
+
+                    // Restore in-game memory values cleanly
+                    GameReader.RestoreWorldFov();
+                    GameReader.RestoreViewmodelFov();
+                    GameReader.RestoreNoSway();
+                    GameReader.RestoreNoRecoil();
+                    GameReader.RestoreBunnyhop();
+                    GameReader.RestoreViewangleAim();
+                    GameReader.RestoreNoFlash();
+                    GameReader.RestoreNoSmoke();
+                    GameReader.RestoreBrightness();
+                    GameReader.RestoreGunFlashlight();
+                    GameReader.TryRestoreInstantAds();
+                    GameReader.TryRestoreTpv();
+
+                    CleanStaleImguiIni();
+
+                    // Close FPGA connection
+                    try
+                    {
+                        ScpslMemory.Instance?.CloseFPGA();
+                    }
+                    catch { }
+
+                    string? exe = Environment.ProcessPath;
+                    if (string.IsNullOrEmpty(exe))
+                    {
+                        try { exe = Process.GetCurrentProcess().MainModule?.FileName; } catch { }
+                    }
+
+                    if (!string.IsNullOrEmpty(exe) && File.Exists(exe))
+                    {
+                        string[] cmdArgs = Environment.GetCommandLineArgs();
+                        string rawArgs = cmdArgs.Length > 1
+                            ? string.Join(" ", cmdArgs.Skip(1).Select(a => a.Contains(' ') ? $"\"{a}\"" : a))
+                            : "";
+
+                        string workingDir = AppDomain.CurrentDomain.BaseDirectory;
+                        string startCmd = string.IsNullOrEmpty(rawArgs)
+                            ? $"start \"\" \"{exe}\""
+                            : $"start \"\" \"{exe}\" {rawArgs}";
+
+                        string extraCleanup = "";
+                        if (deleteConfig) extraCleanup += " & if exist config.json del /f /q config.json";
+                        if (deleteMmap) extraCleanup += " & if exist mmap.txt del /f /q mmap.txt";
+                        extraCleanup += " & if exist imgui.ini del /f /q imgui.ini";
+
+                        var psi = new ProcessStartInfo
+                        {
+                            FileName = "cmd.exe",
+                            Arguments = $"/c timeout /t 1 /nobreak >nul{extraCleanup} & {startCmd}",
+                            CreateNoWindow = true,
+                            UseShellExecute = false,
+                            WorkingDirectory = workingDir
+                        };
+
+                        Process.Start(psi);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.WriteLine($"[Restart] Exception during restart: {ex.Message}");
+                }
+
+                Environment.Exit(0);
             }
 
 
@@ -10666,6 +10795,40 @@ namespace ScpslApp
                                 {
                                     ImGui.Spacing();
                                     ImGui.TextColored(new Vector4(0.40f, 0.85f, 0.40f, 1.0f), _lastConfigStatus);
+                                }
+
+                                ImGui.Spacing();
+                                ImGui.Separator();
+                                ImGui.Spacing();
+                                ImGui.TextColored(new Vector4(0.77f, 0.71f, 0.99f, 1.00f), "Application Management");
+                                ImGui.Spacing();
+
+                                ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.20f, 0.26f, 0.42f, 0.85f));
+                                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.28f, 0.36f, 0.58f, 1.00f));
+                                ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.16f, 0.20f, 0.34f, 1.00f));
+                                if (ImGui.Button("Reload / Restart Application##ReloadAppBtn", new Vector2(-1, 28)))
+                                {
+                                    RestartApplication(deleteConfig: false, deleteMmap: false);
+                                }
+                                ImGui.PopStyleColor(3);
+                                if (ImGui.IsItemHovered())
+                                {
+                                    ImGui.SetTooltip("Closes the overlay and restarts the application cleanly.");
+                                }
+
+                                ImGui.Spacing();
+
+                                ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.50f, 0.16f, 0.16f, 0.85f));
+                                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.68f, 0.20f, 0.20f, 1.00f));
+                                ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.40f, 0.12f, 0.12f, 1.00f));
+                                if (ImGui.Button("Delete Config + mmap & Restart##ResetAllRestartBtn", new Vector2(-1, 28)))
+                                {
+                                    RestartApplication(deleteConfig: true, deleteMmap: true);
+                                }
+                                ImGui.PopStyleColor(3);
+                                if (ImGui.IsItemHovered())
+                                {
+                                    ImGui.SetTooltip("Deletes config.json and mmap.txt, then restarts the application.");
                                 }
                             }
                             ImGui.EndChild();
@@ -12212,10 +12375,13 @@ namespace ScpslApp
                 GameReader.RestoreGunFlashlight();
                 GameReader.TryRestoreInstantAds();
                 GameReader.TryRestoreTpv();
+                ScpslOverlay.CleanStaleImguiIni();
             };
 
             try
             {
+                ScpslOverlay.CleanStaleImguiIni();
+
                 // Default console to hidden unless showconsole.cfg exists or --console / --show-console / --diag is passed
                 bool keepConsole = File.Exists(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "showconsole.cfg")) ||
                                    Array.Exists(args, a => string.Equals(a, "--console", StringComparison.OrdinalIgnoreCase) ||
@@ -12250,6 +12416,7 @@ namespace ScpslApp
                             ScpslOverlay.SaveConfig();
                     }
                     catch { }
+                    ScpslOverlay.CleanStaleImguiIni();
                 };
 
                 Log.WriteLine("Launching DirectX 11 Overlay... (F1 or INSERT = Toggle Menu)");
@@ -12260,6 +12427,7 @@ namespace ScpslApp
                         ScpslOverlay.SaveConfig();
                 }
                 catch { }
+                ScpslOverlay.CleanStaleImguiIni();
                 GameReader.RestoreWorldFov();
                 GameReader.RestoreViewmodelFov();
                 GameReader.RestoreNoSway();
