@@ -7301,6 +7301,54 @@ namespace ScpslApp
             }
         }
 
+        private static ulong _cachedNativeCameraFovAddr = 0;
+        private static long _lastCameraFovResolveTicks = 0;
+
+        public static ulong GetCameraFovAddress()
+        {
+            long now = Stopwatch.GetTimestamp();
+            if (_cachedNativeCameraFovAddr != 0 && (now - _lastCameraFovResolveTicks) < (Stopwatch.Frequency / 2))
+            {
+                return _cachedNativeCameraFovAddr;
+            }
+
+            _lastCameraFovResolveTicks = now;
+
+            // 1. Resolve via CameraShakeController singleton -> _camera (+0x20) -> natCam (+0x10) -> +0x170 (FOV)
+            ulong cscSf = StaticFields(Offsets.CameraShakeController_TypeInfo);
+            if (cscSf != 0)
+            {
+                ulong cscInst = Mem.Ptr(cscSf + 0x0, false);
+                if (cscInst != 0 && cscInst.IsValidVirtualAddress())
+                {
+                    ulong camObj = Mem.Ptr(cscInst + 0x20, false);
+                    if (camObj != 0 && camObj.IsValidVirtualAddress())
+                    {
+                        ulong natCam = Mem.Ptr(camObj + 0x10, false);
+                        if (natCam != 0 && natCam.IsValidVirtualAddress())
+                        {
+                            _cachedNativeCameraFovAddr = natCam + UnityOffsets.Camera.FOV;
+                            return _cachedNativeCameraFovAddr;
+                        }
+                    }
+                }
+            }
+
+            // 2. Fallback to active world camera if resolved by WorldFovChanger
+            if (_activeWorldCameraObj != 0 && _activeWorldCameraObj.IsValidVirtualAddress())
+            {
+                ulong natCam = Mem.Ptr(_activeWorldCameraObj + 0x10, false);
+                if (natCam != 0 && natCam.IsValidVirtualAddress())
+                {
+                    _cachedNativeCameraFovAddr = natCam + UnityOffsets.Camera.FOV;
+                    return _cachedNativeCameraFovAddr;
+                }
+            }
+
+            _cachedNativeCameraFovAddr = 0;
+            return 0;
+        }
+
         // ── 4. UNIFIED SINGLE-ROUND SCATTER READ (Positions + Camera in ONE PCIe cycle) ──
         public static CameraInfo PollPositionsAndCamera(List<PlayerInfo> players)
         {
@@ -7312,6 +7360,7 @@ namespace ScpslApp
 
             ulong sf = StaticFields(Offsets.MainCameraController_TypeInfo);
             int camIndex = players.Count;
+            ulong fovAddr = GetCameraFovAddress();
 
             using (var map = ScatterReadMap.Get())
             {
@@ -7329,6 +7378,10 @@ namespace ScpslApp
                 {
                     round[camIndex].AddEntry<Vector3>(0, sf + Offsets.MCC_LastPosition);
                     round[camIndex].AddEntry<Quaternion>(1, sf + Offsets.MCC_LastRotation);
+                    if (fovAddr != 0)
+                    {
+                        round[camIndex].AddEntry<float>(2, fovAddr);
+                    }
                 }
 
                 map.Execute();
@@ -7361,6 +7414,10 @@ namespace ScpslApp
                         {
                             cam.Position = cPos;
                             cam.Rotation = cRot;
+                            if (fovAddr != 0 && idx.TryGetResult(2, out float dynFov) && dynFov >= 10.0f && dynFov <= 170.0f)
+                            {
+                                cam.Fov = dynFov;
+                            }
                             cam.Valid = true;
                             return cam;
                         }
@@ -8107,6 +8164,16 @@ namespace ScpslApp
             {
                 Fov = ActiveWorldFov
             };
+
+            ulong fovAddr = GetCameraFovAddress();
+            if (fovAddr != 0)
+            {
+                float dynFov = Mem.Val<float>(fovAddr, false);
+                if (dynFov >= 10.0f && dynFov <= 170.0f)
+                {
+                    cam.Fov = dynFov;
+                }
+            }
 
             ulong sf = StaticFields(Offsets.MainCameraController_TypeInfo);
             if (sf != 0)
@@ -11666,6 +11733,7 @@ namespace ScpslApp
                 Console.WriteLine($"  _singleton: 0x{mccInst2:X} ({GameReader.ClassName(mccInst2)})");
                 Console.WriteLine($"  LastPosition: {lastPos}");
                 Console.WriteLine($"  _defaultPos: {defaultPos}");
+
 
                 ulong sccRva = 0x846900;
                 ulong sccAddr = DmaMemory.GameAssemblyBase + sccRva;
