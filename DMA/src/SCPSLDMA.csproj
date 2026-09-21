@@ -3,6 +3,7 @@
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
     <RootNamespace>DmaBase</RootNamespace>
     <AssemblyName>SCPSLDMA</AssemblyName>
     <TargetName>SCPSLDMA</TargetName>
@@ -31,6 +32,7 @@
     <PackageReference Include="VmmSharpEx" Version="3.200.12" />
     <PackageReference Include="ClickableTransparentOverlay" Version="9.2.0" />
     <IconFiles Include="$(MSBuildProjectDirectory)\Unity\Icons\*.png" />
+    <EmbeddedResource Include="Radar\MapSprites\*.png" />
   </ItemGroup>
 
   <Target Name="CopyIconsToOutDir" AfterTargets="Build">

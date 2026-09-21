@@ -12,6 +12,7 @@ using DmaBase;
 using DmaBase.DMA;
 using DmaBase.Misc;
 using DmaBase.Misc.Config;
+using DmaBase.Radar;
 using DmaBase.Unity;
 using DmaBase.Unity.LowLevel;
 using DmaBase.DMA.ScatterAPI;
@@ -551,6 +552,20 @@ namespace ScpslApp
         public bool ShowWatermark { get; set; } = false;
         public bool VSync { get; set; } = true;
 
+        // Radar Window (SCP-079 Tactical Minimap)
+        public bool RadarEnabled { get; set; } = true;
+        public int RadarWindowX { get; set; } = 100;
+        public int RadarWindowY { get; set; } = 100;
+        public int RadarWindowWidth { get; set; } = 1000;
+        public int RadarWindowHeight { get; set; } = 850;
+        public bool RadarWindowMaximized { get; set; } = false;
+        public float RadarZoom { get; set; } = 1.0f;
+        public bool RadarFollowPlayer { get; set; } = true;
+        public bool RadarShowRoomNames { get; set; } = true;
+        public bool RadarShowPlayers { get; set; } = true;
+        public bool RadarShowSCPs { get; set; } = true;
+        public int RadarZoneMode { get; set; } = 0; // 0 = Auto, 1 = HCZ+EZ, 2 = LCZ, 3 = Surface
+
         // Preferences
         public bool AutoSave { get; set; } = true;
         [JsonConverter(typeof(JsonStringEnumConverter<UnityKeyCode>))]
@@ -920,6 +935,34 @@ namespace ScpslApp
         Other = 5
     }
 
+    public enum RoomShape : int
+    {
+        Undefined = 0,
+        Endroom = 1,
+        Straight = 2,
+        Curve = 3,
+        TShape = 4,
+        XShape = 5
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Vector3Int : IEquatable<Vector3Int>
+    {
+        public int X;
+        public int Y;
+        public int Z;
+
+        public Vector3Int(int x, int y, int z)
+        {
+            X = x; Y = y; Z = z;
+        }
+
+        public bool Equals(Vector3Int other) => X == other.X && Y == other.Y && Z == other.Z;
+        public override bool Equals(object? obj) => obj is Vector3Int other && Equals(other);
+        public override int GetHashCode() => HashCode.Combine(X, Y, Z);
+        public override string ToString() => $"<{X}, {Y}, {Z}>";
+    }
+
     public enum RoomName
     {
         Unnamed = 0,
@@ -1081,6 +1124,18 @@ namespace ScpslApp
         public Quaternion Rotation;
         public float Fov;
         public bool Valid;
+
+        public readonly Vector3 Forward
+        {
+            get
+            {
+                var camRot = Rotation;
+                float xx = camRot.X * camRot.X, yy = camRot.Y * camRot.Y;
+                float xz = camRot.X * camRot.Z, yz = camRot.Y * camRot.Z;
+                float wx = camRot.W * camRot.X, wy = camRot.W * camRot.Y;
+                return new Vector3(2f * (xz + wy), 2f * (yz - wx), 1f - 2f * (xx + yy));
+            }
+        }
     }
 
     public readonly struct CameraFrame
@@ -1181,7 +1236,12 @@ namespace ScpslApp
         public ulong Address;
         public RoomName Name;
         public FacilityZone Zone;
+        public RoomShape Shape;
         public Vector3 Position;
+        public Vector3 Extents;
+        public Vector3Int MainCoords;
+        public float RotationYaw;
+        public List<ulong> ConnectedRoomAddrs = new();
 
         // UI Text & Metric Caching
         public int CachedDistanceInt = -1;
@@ -1456,9 +1516,13 @@ namespace ScpslApp
 
         public const float DefaultVerticalFOV = 70.0f;
         public const ulong RI_static_AllRoomIdentifiers = 0x0;   // HashSet<RoomIdentifier> at static fields + 0x0
+        public const ulong RI_ConnectedRooms = 0x20;            // HashSet<RoomIdentifier> at 0x20
+        public const ulong RI_Shape = 0x30;                     // RoomShape enum (int)
         public const ulong RI_Name = 0x34;                      // RoomName enum (int)
         public const ulong RI_Zone = 0x38;                      // FacilityZone enum (int)
+        public const ulong RI_MainCoords = 0x48;                // Vector3Int (x, y, z)
         public const ulong RI_WorldspaceBounds = 0x54;          // Bounds.center Vector3 starts at offset 0x54
+        public const ulong RI_WorldspaceExtents = 0x60;         // Bounds.extents Vector3 starts at offset 0x60
         // AlphaWarheadController
         public const ulong AWC_static_Singleton = 0x0;
         public const ulong AWC_IsLocked = 0x98;            // bool
@@ -8290,6 +8354,10 @@ namespace ScpslApp
                     idx.AddEntry<int>(0, roomPtrs[i] + Offsets.RI_Name);
                     idx.AddEntry<int>(1, roomPtrs[i] + Offsets.RI_Zone);
                     idx.AddEntry<Vector3>(2, roomPtrs[i] + Offsets.RI_WorldspaceBounds);
+                    idx.AddEntry<int>(3, roomPtrs[i] + Offsets.RI_Shape);
+                    idx.AddEntry<Vector3Int>(4, roomPtrs[i] + Offsets.RI_MainCoords);
+                    idx.AddEntry<Vector3>(5, roomPtrs[i] + Offsets.RI_WorldspaceExtents);
+                    idx.AddEntry<ulong>(6, roomPtrs[i] + Offsets.RI_ConnectedRooms);
                 }
                 map.Execute();
 
@@ -8299,6 +8367,11 @@ namespace ScpslApp
                     if (idx.TryGetResult(0, out int nameVal) && idx.TryGetResult(2, out Vector3 pos))
                     {
                         idx.TryGetResult(1, out int zoneVal);
+                        idx.TryGetResult(3, out int shapeVal);
+                        idx.TryGetResult(4, out Vector3Int coords);
+                        idx.TryGetResult(5, out Vector3 extents);
+                        idx.TryGetResult(6, out ulong connHashSet);
+
                         var roomName = (RoomName)nameVal;
                         var roomZone = (FacilityZone)zoneVal;
                         if (roomZone <= FacilityZone.None || roomZone > FacilityZone.Other)
@@ -8306,12 +8379,31 @@ namespace ScpslApp
                             roomZone = RoomConfig.GetZone(roomName);
                         }
 
+                        var connected = new List<ulong>();
+                        if (connHashSet != 0 && connHashSet.IsValidVirtualAddress())
+                        {
+                            connected = HashSetElements(connHashSet);
+                        }
+
+                        ulong nativeTr = ResolveNativeTransformFromComponent(roomPtrs[i]);
+                        var (trPos, yawDeg) = ReadNativeTransform(nativeTr);
+
+                        // Snap room position to the authentic 15m grid
+                        Vector3 gridPos = (coords.X != 0 || coords.Z != 0)
+                            ? new Vector3(coords.X * 15.0f, coords.Y * 100.0f, coords.Z * 15.0f)
+                            : (trPos != Vector3.Zero ? trPos : pos);
+
                         rooms.Add(new RoomInfo
                         {
                             Address = roomPtrs[i],
                             Name = roomName,
                             Zone = roomZone,
-                            Position = pos
+                            Shape = (RoomShape)shapeVal,
+                            Position = gridPos,
+                            Extents = extents,
+                            MainCoords = coords,
+                            RotationYaw = yawDeg,
+                            ConnectedRoomAddrs = connected
                         });
                     }
                 }
@@ -8325,24 +8417,25 @@ namespace ScpslApp
         private static List<GeneratorInfo> _cachedGenerators = new();
         private static DateTime _lastGenFetch = DateTime.MinValue;
 
-        private static Vector3 ReadNativeTransformPosition(ulong nativeTr)
+        private static (Vector3 pos, float yawDeg) ReadNativeTransform(ulong nativeTr)
         {
-            if (nativeTr == 0 || !nativeTr.IsValidVirtualAddress()) return Vector3.Zero;
+            if (nativeTr == 0 || !nativeTr.IsValidVirtualAddress()) return (Vector3.Zero, 0f);
             try
             {
                 ulong hier = Mem.Ptr(nativeTr + Offsets.NativeTr_hierarchy);
                 int index = Mem.Val<int>(nativeTr + Offsets.NativeTr_index);
-                if (hier == 0 || !hier.IsValidVirtualAddress() || index < 0 || index > 65536) return Vector3.Zero;
+                if (hier == 0 || !hier.IsValidVirtualAddress() || index < 0 || index > 65536) return (Vector3.Zero, 0f);
 
                 ulong vertsAddr = Mem.Ptr(hier + Offsets.Hier_vertices);
                 ulong indicesAddr = Mem.Ptr(hier + Offsets.Hier_indices);
                 int cap = Mem.Val<int>(hier + Offsets.Hier_capacity);
                 if (!vertsAddr.IsValidVirtualAddress() || !indicesAddr.IsValidVirtualAddress() || cap <= 0 || cap > 65536 || index >= cap)
-                    return Vector3.Zero;
+                    return (Vector3.Zero, 0f);
 
                 // Read vertex at index
                 var vert = Mem.Val<UnityTransform.TrsX>(vertsAddr + (ulong)(index * Unsafe.SizeOf<UnityTransform.TrsX>()), false);
                 Vector3 pos = vert.t;
+                Quaternion q = vert.q;
 
                 int parent = Mem.Val<int>(indicesAddr + (ulong)(index * 4), false);
                 int iter = 0;
@@ -8350,14 +8443,29 @@ namespace ScpslApp
                 {
                     var pt = Mem.Val<UnityTransform.TrsX>(vertsAddr + (ulong)(parent * Unsafe.SizeOf<UnityTransform.TrsX>()), false);
                     pos = pt.q.Multiply(pos) * pt.s + pt.t;
+                    q = pt.q * q;
                     parent = Mem.Val<int>(indicesAddr + (ulong)(parent * 4), false);
                 }
 
+                // Unity eulerAngles.y from quaternion
+                float siny_cosp = 2.0f * (q.W * q.Y + q.X * q.Z);
+                float cosy_cosp = 1.0f - 2.0f * (q.Y * q.Y + q.Z * q.Z);
+                float yawRad = MathF.Atan2(siny_cosp, cosy_cosp);
+                float yawDeg = yawRad * (180.0f / MathF.PI);
+                if (yawDeg < 0f) yawDeg += 360f;
+
                 if (Math.Abs(pos.X) < 20000f && Math.Abs(pos.Y) < 20000f && Math.Abs(pos.Z) < 20000f)
-                    return pos;
+                    return (pos, yawDeg);
+                return (Vector3.Zero, yawDeg);
             }
             catch { }
-            return Vector3.Zero;
+            return (Vector3.Zero, 0f);
+        }
+
+        private static Vector3 ReadNativeTransformPosition(ulong nativeTr)
+        {
+            var (pos, _) = ReadNativeTransform(nativeTr);
+            return pos;
         }
 
         private static Vector3 ResolveNativeTransformPosition(ulong nativeTr)
@@ -8378,18 +8486,14 @@ namespace ScpslApp
             return Vector3.Zero;
         }
 
-        private static Vector3 ResolveTransformFromComponent(ulong comp)
+        private static ulong ResolveNativeTransformFromComponent(ulong comp)
         {
-            if (comp == 0 || !comp.IsValidVirtualAddress()) return Vector3.Zero;
+            if (comp == 0 || !comp.IsValidVirtualAddress()) return 0;
 
             try
             {
                 ulong nativeComp = Mem.Ptr(comp + 0x10);
-                if (nativeComp == 0 || !nativeComp.IsValidVirtualAddress()) return Vector3.Zero;
-
-                // If nativeComp itself is already a native Transform
-                Vector3 direct = ResolveNativeTransformPosition(nativeComp);
-                if (direct != Vector3.Zero) return direct;
+                if (nativeComp == 0 || !nativeComp.IsValidVirtualAddress()) return 0;
 
                 // Candidate offsets for GameObject pointer on native Component: 0x20, 0x30, 0x58
                 ulong[] goOffsets = [0x20, 0x30, 0x58];
@@ -8408,15 +8512,23 @@ namespace ScpslApp
                         // Component[0] at compArray + 0x8 is ALWAYS the native Transform
                         ulong nativeTr = Mem.Ptr(compArray + 0x8);
                         if (nativeTr != 0 && nativeTr.IsValidVirtualAddress())
-                        {
-                            Vector3 p = ResolveNativeTransformPosition(nativeTr);
-                            if (p != Vector3.Zero) return p;
-                        }
+                            return nativeTr;
                     }
                 }
             }
             catch { }
 
+            return 0;
+        }
+
+        private static Vector3 ResolveTransformFromComponent(ulong comp)
+        {
+            ulong tr = ResolveNativeTransformFromComponent(comp);
+            if (tr != 0)
+            {
+                Vector3 p = ResolveNativeTransformPosition(tr);
+                if (p != Vector3.Zero) return p;
+            }
             return Vector3.Zero;
         }
 
@@ -9022,7 +9134,7 @@ namespace ScpslApp
         // ═══════════════════════════════════════════════════════════
         public class ScpslOverlay : Overlay
         {
-            private sealed class GameSnapshot
+            public sealed class GameSnapshot
             {
                 public readonly List<PlayerInfo> Players;
                 public readonly List<RoomInfo> Rooms;
@@ -9045,6 +9157,13 @@ namespace ScpslApp
             }
 
             private static volatile GameSnapshot _currentSnapshot = new(new(), new(), default, default, new(), new(), new());
+            public static GameSnapshot CurrentSnapshot => _currentSnapshot;
+
+            private static ConfigData _cachedConfig = new();
+            public static ConfigData GetConfig() => _cachedConfig;
+            private static bool _radarEnabled = true;
+            public static bool RadarEnabled => _radarEnabled;
+            private static Thread? _radarThread;
             private static volatile LocalInventoryState _latestInventory = new();
             private static long _lastInventoryPollTicks;
             private static PanelWarheadInfo _latestWarhead;
@@ -9080,6 +9199,40 @@ namespace ScpslApp
             public static int LatestRoundTime => _latestRoundTime;
             public static IReadOnlyList<PlayerInfo> CurrentPlayers => _currentSnapshot.Players;
             public static Stopwatch LocalRoundStopwatch => _localRoundStopwatch;
+
+            public static void StartRadarWindow()
+            {
+                if (_radarThread != null && _radarThread.IsAlive)
+                {
+                    RadarForm.Instance?.BeginInvoke(new Action(() =>
+                    {
+                        if (RadarForm.Instance.WindowState == FormWindowState.Minimized)
+                            RadarForm.Instance.WindowState = FormWindowState.Normal;
+                        RadarForm.Instance.BringToFront();
+                        RadarForm.Instance.Focus();
+                    }));
+                    return;
+                }
+
+                _radarThread = new Thread(() =>
+                {
+                    try
+                    {
+                        Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
+                        Application.EnableVisualStyles();
+                        Application.SetCompatibleTextRenderingDefault(false);
+                        var form = new RadarForm();
+                        Application.Run(form);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.WriteLine($"[Radar Window Error] {ex.Message}");
+                    }
+                });
+                _radarThread.SetApartmentState(ApartmentState.STA);
+                _radarThread.IsBackground = true;
+                _radarThread.Start();
+            }
 
             private int _overlayWidth;
             private int _overlayHeight;
@@ -9170,6 +9323,11 @@ namespace ScpslApp
                 GetWindowHandle();
 
                 MonitorChooser.OnPostInitialized(this);
+
+                if (_radarEnabled)
+                {
+                    StartRadarWindow();
+                }
 
                 bool keepConsole = File.Exists(ConsoleCfgPath);
                 _showConsoleOnStart = keepConsole;
@@ -10182,6 +10340,19 @@ namespace ScpslApp
                         HudY = _instance?._hudY ?? 10,
                         VSync = _instance?.VSync ?? true,
 
+                        RadarEnabled = _radarEnabled,
+                        RadarWindowX = _cachedConfig.RadarWindowX,
+                        RadarWindowY = _cachedConfig.RadarWindowY,
+                        RadarWindowWidth = _cachedConfig.RadarWindowWidth,
+                        RadarWindowHeight = _cachedConfig.RadarWindowHeight,
+                        RadarWindowMaximized = _cachedConfig.RadarWindowMaximized,
+                        RadarZoom = _cachedConfig.RadarZoom,
+                        RadarFollowPlayer = _cachedConfig.RadarFollowPlayer,
+                        RadarShowRoomNames = _cachedConfig.RadarShowRoomNames,
+                        RadarShowPlayers = _cachedConfig.RadarShowPlayers,
+                        RadarShowSCPs = _cachedConfig.RadarShowSCPs,
+                        RadarZoneMode = _cachedConfig.RadarZoneMode,
+
                         AutoSave = _instance?._autoSave ?? true,
                         MenuKey = MenuKey,
                         StreamerMode = _streamerMode,
@@ -10290,6 +10461,9 @@ namespace ScpslApp
                         _instance.VSync = cfg.VSync;
                         _instance._autoSave = cfg.AutoSave;
                     }
+
+                    _cachedConfig = cfg;
+                    _radarEnabled = cfg.RadarEnabled;
 
                     _skeletonEsp = cfg.SkeletonEsp;
                     _headCircleEsp = cfg.HeadCircleEsp;
@@ -11544,6 +11718,34 @@ namespace ScpslApp
                                 ImGui.Spacing();
                                 ToggleSwitch("##VSync", ref VSync, $"VSync ({_targetFps} Hz)");
 
+                                ImGui.Spacing();
+                                ImGui.Separator();
+                                ImGui.Spacing();
+                                ImGui.TextColored(new Vector4(0.77f, 0.71f, 0.99f, 1.00f), "Tactical Radar (SCP-079)");
+                                ImGui.Spacing();
+                                if (ToggleSwitch("##RadarEnabled", ref _radarEnabled, "Enable Radar Window"))
+                                {
+                                    if (_radarEnabled)
+                                    {
+                                        StartRadarWindow();
+                                    }
+                                    else
+                                    {
+                                        RadarForm.Instance?.BeginInvoke(new Action(() =>
+                                        {
+                                            RadarForm.Instance.Close();
+                                        }));
+                                    }
+                                }
+                                if (_radarEnabled)
+                                {
+                                    ImGui.Spacing();
+                                    if (ImGui.Button("Open / Focus Radar##OpenRadarBtn", new Vector2(170, 26)))
+                                    {
+                                        StartRadarWindow();
+                                    }
+                                }
+
                                 if (!MonitorChooser.IsExternalMode && MonitorChooser.Monitors.Count > 1)
                                 {
                                     ImGui.Spacing();
@@ -12647,6 +12849,18 @@ namespace ScpslApp
             }
             var rooms = GameReader.ReadRooms();
             Console.WriteLine($"  ReadRooms() returned {rooms.Count} rooms");
+            foreach (var group in rooms.GroupBy(r => r.Zone))
+            {
+                float minX = float.MaxValue, minY = float.MaxValue, minZ = float.MaxValue;
+                float maxX = float.MinValue, maxY = float.MinValue, maxZ = float.MinValue;
+                foreach (var r in group)
+                {
+                    minX = MathF.Min(minX, r.Position.X); maxX = MathF.Max(maxX, r.Position.X);
+                    minY = MathF.Min(minY, r.Position.Y); maxY = MathF.Max(maxY, r.Position.Y);
+                    minZ = MathF.Min(minZ, r.Position.Z); maxZ = MathF.Max(maxZ, r.Position.Z);
+                }
+                Console.WriteLine($"  Zone {group.Key}: {group.Count()} rooms, X=[{minX:0.0}..{maxX:0.0}], Y=[{minY:0.0}..{maxY:0.0}], Z=[{minZ:0.0}..{maxZ:0.0}]");
+            }
             var cam = GameReader.ReadCamera();
             Console.WriteLine($"  Camera Valid: {cam.Valid}, Pos: {cam.Position}");
 
@@ -13204,6 +13418,49 @@ namespace ScpslApp
 
         public static void Main(string[] args)
         {
+            if (args.Length > 0 && args[0] == "--rooms")
+            {
+                Log.AllocateConsoleWindow();
+                var outPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "rooms.txt");
+                File.WriteAllText(outPath, "Starting --rooms...\n");
+                var config = new ScpslConfig();
+                SharedProgram.Initialize(new DirectoryInfo(AppDomain.CurrentDomain.BaseDirectory), config);
+                ScpslOverlay.LoadConfig();
+                var dma = new ScpslMemory("SCPSL.exe");
+                int attempts = 0;
+                while (!dma.Ready && attempts < 300)
+                {
+                    Thread.Sleep(100);
+                    attempts++;
+                }
+                if (!dma.Ready)
+                {
+                    File.AppendAllText(outPath, $"[ROOMS] DMA failed to attach after {attempts} attempts! PID={dma.ProcessPID}\n");
+                    return;
+                }
+                var rooms = GameReader.ReadRooms();
+                var sb = new StringBuilder();
+                sb.AppendLine($"[ROOMS] Total rooms: {rooms.Count}");
+                var roomsByAddr = rooms.ToDictionary(r => r.Address, r => r);
+                foreach (var r in rooms.OrderBy(r => r.Zone).ThenBy(r => r.MainCoords.X).ThenBy(r => r.MainCoords.Z))
+                {
+                    var conns = r.ConnectedRoomAddrs.Select(a => roomsByAddr.TryGetValue(a, out var cr) ? cr.Name.ToString() : $"0x{a:X}").ToList();
+                    string line = $"[{r.Zone}] {r.Name,-25} Shape={r.Shape,-10} Coords=({r.MainCoords.X,2},{r.MainCoords.Y,2},{r.MainCoords.Z,2}) Grid=({r.Position.X:0.0},{r.Position.Z:0.0}) Yaw={r.RotationYaw:0.0} Conns=[{string.Join(", ", conns)}]";
+                    Console.WriteLine(line);
+                    sb.AppendLine(line);
+                }
+                var snap = GameReader.ScpslOverlay.CurrentSnapshot;
+                var cam = GameReader.ScpslOverlay.GetLatestCamera();
+                sb.AppendLine($"[CAM] Valid={cam.Valid} Pos={cam.Position} Fwd={cam.Forward}");
+                var local = snap.Players.FirstOrDefault(p => p.IsLocal);
+                if (local != null)
+                {
+                    sb.AppendLine($"[LOCAL] Pos={local.Position} Role={local.Role} Alive={local.Alive}");
+                }
+                File.WriteAllText(outPath, sb.ToString());
+                return;
+            }
+
             if (args.Length > 0 && args[0] == "--diag")
             {
                 Log.AllocateConsoleWindow();
