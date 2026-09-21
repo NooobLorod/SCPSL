@@ -5,7 +5,7 @@
 
 # SCPSL DMA
 
-Latest additons - freecam (pretty good) (hotfix, fixed bunnyhop only hopping once)
+Latest additons - radar woohoo (seperate window)
 
 ---
 
