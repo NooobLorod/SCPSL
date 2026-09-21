@@ -52,6 +52,24 @@ Latest additons - radar woohoo (seperate window)
 - **Granular HUD Toggles** — Toggle individual HUD elements with dynamic background card auto-resizing
 - **Interactive Repositioning** — Press `F7` to unlock and drag the HUD anywhere on screen
 
+
+### 🛰️ 2D Tactical Radar (Separate Window)
+- **Standalone Secondary Window** — Dedicated borderless/windowed radar window built for dual-monitor setups; move, resize, minimize, or maximize anywhere independently without impacting main game performance.
+- **Authentic SCP-079 Surveillance Layout** — High-resolution procedural facility map rendering for Heavy Containment (HCZ), Entrance Zone (EZ), Light Containment (LCZ), and Surface.
+- **Zero-Flicker Offscreen Bitmap Cache** — Room geometry is pre-rendered onto an offscreen canvas and blitted in a single pass, completely eliminating 1-pixel seam jitter, gap flicker, and line tearing while moving.
+- **Exponential Motion Smoothing** — 20Hz camera focal-point smoothing absorbs DMA read latency for fluid navigation.
+- **Directional Golden Amber Wedge** — High-visibility local player indicator with a live view-direction cone showing your exact facing angle.
+- **Role-Colored Player Chevrons** — Live player positions and view headings color-coded by faction:
+  - **Red** — SCPs
+  - **Orange** — Class-D
+  - **Light Green** — Scientists
+  - **Cyan** — MTF / Facility Guards
+  - **Green** — Chaos Insurgency
+  - **Gray** — Spectators / Dead
+- **Granular In-Window Controls** — Toggle room labels, player markers, SCP markers, camera centering, manual zoom scaling, and zone filtering directly from the top menu bar.
+- **Persistent Configuration** — Automatically saves and restores radar window position, size, zoom level, and toggle preferences in `config.json`.
+
+
 ### ⚙️ Memory Writes
 
 - **FREECAM**
